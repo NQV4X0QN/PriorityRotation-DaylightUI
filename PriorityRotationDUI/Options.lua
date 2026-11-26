@@ -13,6 +13,8 @@ local API, MODULE = PR.API, PR.MODULE
 PR.defaults = {
     rotationOn = true,
 }
+-- Hide Error Text (ErrorText.lua): one switch per group, all off to start.
+for _, g in ipairs(PR.ERROR_GROUPS or {}) do PR.defaults[PR.ErrorKey(g)] = false end
 
 local function Get(key)
     local ok, v = pcall(API.GetSetting, MODULE, key)
@@ -38,9 +40,19 @@ PR.pages = {
       } },
 }
 
+-- The Error Messages page: DaylightUI's own error settings stay on beside these (ErrorText.lua says why).
+local errorRows = {}
+for _, g in ipairs(PR.ERROR_GROUPS or {}) do
+    errorRows[#errorRows + 1] = { type = "toggle", key = PR.ErrorKey(g), label = g.label, desc = g.tip, reload = true }
+end
+PR.pages[#PR.pages + 1] = { id = "errors", label = "Error Messages",
+    desc = "Keep chosen groups of the game's red error messages off the screen, and their voice lines quiet.",
+    groups = { { label = "Hide error text", items = errorRows } } }
+
 PR.me.On("SettingChanged", function(scope, path, value)
     if scope ~= MODULE then return end
     if path == "rotationOn" then PR:SetEnabled(value) end
+    if type(path) == "string" and path:find("^hideErrors_") and PR.SaveErrorChoices then PR.SaveErrorChoices(Get) end
 end)
 
 PR.DUI_MODULE = _G.DaylightUI:RegisterModule(MODULE, {
@@ -52,5 +64,7 @@ PR.DUI_MODULE = _G.DaylightUI:RegisterModule(MODULE, {
     -- rotation picks up the saved switch here without compiling twice.
     OnEnable = function()
         if PR.db then PR.db.enabled = Get("rotationOn") ~= false end
+        -- The error choices this profile holds, for the next load (ErrorText.lua reads them at ADDON_LOADED).
+        if PR.SaveErrorChoices then PR.SaveErrorChoices(Get) end
     end,
 })

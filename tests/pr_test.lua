@@ -279,7 +279,7 @@ local function boot(opts)
     if unit == "player" and filter == "HELPFUL" then return w.auras[name] end end }
   w.PR = {}
   for _, file in ipairs({ "Plugin", "Lib", "Widgets", "Core", "Reequip", "Profiles", "SpellbookOpener", "Editor",
-                             "Settings", "Options" }) do
+                             "Settings", "ErrorText", "Options" }) do
     local chunk = assert(loadfile("PriorityRotationDUI/" .. file .. ".lua"))
     chunk("PriorityRotationDUI", w.PR)
   end
@@ -288,6 +288,7 @@ local function boot(opts)
   end
   w.fire = fire
   fire("ADDON_LOADED", "PriorityRotationDUI")
+  if _G.__afterAddonLoaded then _G.__afterAddonLoaded() end   -- a suite's look at the state before any login
   -- DaylightUI turns its modules on in its own PLAYER_LOGIN, before the plugin's.
   local mod = _G.__duiModules.PriorityRotationDUI
   if mod and mod.OnEnable then mod.OnEnable(mod) end
@@ -987,6 +988,47 @@ do
   seq = table.concat(w.PR.compiledSequence, "\n")
   check("17e) other spells are unchanged", seq:find("/cast [nochanneling] Alpha", 1, true) ~= nil
         and not seq:find("/startattack", 1, true), seq)
+end
+
+-- 2026-11-25: Hide Error Text (ErrorText.lua). The chosen groups' types go on Blizzard's hidden list at this addon's
+-- ADDON_LOADED, before DaylightUI claims every type at its PLAYER_LOGIN; the choices are copied from the options
+-- page into the saved variables. DISCRIMINATION: with the ADDON_LOADED write moved to PLAYER_LOGIN, 18a fails;
+-- with SaveErrorChoices dropped from the SettingChanged handler, 18d fails.
+out("P18) Hide Error Text")
+do
+  local ERRS = { SPELL_FAILED_S = 57, SPELL_FAILED_SHAPESHIFT_FORM_S = 279, MAIL_DATABASE_ERROR = 460,
+                 OUT_OF_RAGE = 359, INV_FULL = 3 }
+  local calls, order = {}, {}
+  local function setup()
+    for k, v in pairs(ERRS) do _G["LE_GAME_ERR_" .. k] = v end
+    calls, order = {}, {}
+    _G.UIErrorsFrame = { SetMessageTypeEnabled = function(_, t, en) calls[t] = en; order[#order + 1] = t end }
+  end
+  setup()
+  local atLoad = {}
+  _G.__afterAddonLoaded = function() for t, v in pairs(calls) do atLoad[t] = v end end
+  local w = boot({ db = { enabled = true, profiles = {}, hiddenErrors = { spells = true } } })
+  _G.__afterAddonLoaded = nil
+  check("18a) chosen at the last session: its types hidden at load, before any login", atLoad[57] == false
+        and atLoad[279] == false and atLoad[359] == false)
+  check("18b) groups not chosen are left alone", calls[460] == nil and calls[3] == nil)
+  local onlyFalse = true
+  for _, v in pairs(calls) do if v ~= false then onlyFalse = false end end
+  check("18c) only ever writes hide", onlyFalse)
+  SetOption("hideErrors_mail", true)
+  check("18d) a change on the options page is kept for the next load", w.PR.db.hiddenErrors.mail == true
+        and w.PR.db.hiddenErrors.spells == nil)
+  local mod = _G.__duiModules.PriorityRotationDUI
+  local page
+  for _, p in ipairs(mod and mod.options.pages or {}) do if p.id == "errors" then page = p end end
+  local rows = page and page.groups[1].items or {}
+  local allReload = #rows == 6
+  for _, r in ipairs(rows) do if r.type ~= "toggle" or not r.reload or mod.defaults[r.key] ~= false then allReload = false end end
+  check("18e) an Error Messages page: six switches, off to start, each saying it takes a /reload", allReload, #rows)
+  setup()
+  boot({ db = { enabled = true, profiles = {} } })
+  check("18f) nothing chosen: nothing written", next(calls) == nil)
+  _G.UIErrorsFrame = nil
 end
 
 out(("=== %d passed, %d failed ==="):format(pass, fail))

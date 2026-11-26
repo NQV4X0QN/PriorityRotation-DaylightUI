@@ -21,4 +21,5 @@ Profiles.lua
 SpellbookOpener.lua
 Editor.lua
 Settings.lua
+ErrorText.lua
 Options.lua
