@@ -1,0 +1,18 @@
+package-as: PriorityRotationDUI
+
+# The repo root holds the addon folder; ship it at the zip's root.
+move-folders:
+  PriorityRotationDUI/PriorityRotationDUI: PriorityRotationDUI
+
+ignore:
+  - README.md
+  - CHANGELOG.md
+  - LICENSE
+  - RELEASE_CHANGELOG.md
+  - tests
+  - .luacheckrc
+
+# Written by the release workflow: this version's section of CHANGELOG.md only.
+manual-changelog:
+  filename: RELEASE_CHANGELOG.md
+  markup-type: markdown
