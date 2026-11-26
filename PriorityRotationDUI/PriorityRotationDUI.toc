@@ -5,6 +5,7 @@
 ## Author: NQV4X0QN
 ## X-Website: https://github.com/NQV4X0QN/PriorityRotation-DaylightUI
 ## X-License: GPL-2.0-or-later
+## X-Curse-Project-ID: 1832101
 ## Dependencies: DaylightUI
 ## OptionalDeps: VeritasUI_PriorityRotation
 ## SavedVariables: PriorityRotationDUIDB

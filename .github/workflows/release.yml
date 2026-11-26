@@ -1,7 +1,7 @@
 name: Package and upload
 
-# A pushed version tag (vX.Y.Z) builds the zip and uploads it to CurseForge once `-p <project id>` is in
-# the tag step's args (as VeritasUI's workflow has it). The GitHub release is made by hand (gh release create).
+# A pushed version tag (vX.Y.Z) builds the zip and uploads it to CurseForge (project 1832101, the -p below; the
+# token is the repository secret CF_API_TOKEN). The GitHub release is made by hand (gh release create).
 # A push to test/packager builds the zip without uploading and keeps it as an artifact.
 on:
   push:
@@ -37,7 +37,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: BigWigsMods/packager@v2
         with:
-          args: -u
+          args: -u -p 1832101
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
 
