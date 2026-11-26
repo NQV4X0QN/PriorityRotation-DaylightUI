@@ -15,6 +15,8 @@ PR.defaults = {
 }
 -- Hide Error Text (ErrorText.lua): one switch per group, all off to start.
 for _, g in ipairs(PR.ERROR_GROUPS or {}) do PR.defaults[PR.ErrorKey(g)] = false end
+-- Mute Sounds (Sounds.lua): one switch per group, all off to start.
+for _, g in ipairs(PR.SOUND_GROUPS or {}) do PR.defaults[PR.SoundKey(g)] = false end
 
 local function Get(key)
     local ok, v = pcall(API.GetSetting, MODULE, key)
@@ -49,10 +51,20 @@ PR.pages[#PR.pages + 1] = { id = "errors", label = "Error Messages",
     desc = "Keep chosen groups of the game's red error messages off the screen, and their voice lines quiet.",
     groups = { { label = "Hide error text", items = errorRows } } }
 
+-- The Sounds page: applies at once.
+local soundRows = {}
+for _, g in ipairs(PR.SOUND_GROUPS or {}) do
+    soundRows[#soundRows + 1] = { type = "toggle", key = PR.SoundKey(g), label = g.label, desc = g.tip }
+end
+PR.pages[#PR.pages + 1] = { id = "sounds", label = "Sounds",
+    desc = "Silence chosen game sounds. A change applies at once.",
+    groups = { { label = "Mute sounds", items = soundRows } } }
+
 PR.me.On("SettingChanged", function(scope, path, value)
     if scope ~= MODULE then return end
     if path == "rotationOn" then PR:SetEnabled(value) end
     if type(path) == "string" and path:find("^hideErrors_") and PR.SaveErrorChoices then PR.SaveErrorChoices(Get) end
+    if type(path) == "string" and path:find("^muteSound_") and PR.ApplySoundMutes then PR.ApplySoundMutes(Get) end
 end)
 
 PR.DUI_MODULE = _G.DaylightUI:RegisterModule(MODULE, {
@@ -66,5 +78,7 @@ PR.DUI_MODULE = _G.DaylightUI:RegisterModule(MODULE, {
         if PR.db then PR.db.enabled = Get("rotationOn") ~= false end
         -- The error choices this profile holds, for the next load (ErrorText.lua reads them at ADDON_LOADED).
         if PR.SaveErrorChoices then PR.SaveErrorChoices(Get) end
+        -- A mute lasts until the game closes, so the chosen sounds are muted again at every login.
+        if PR.ApplySoundMutes then PR.ApplySoundMutes(Get) end
     end,
 })

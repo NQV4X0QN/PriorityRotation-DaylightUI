@@ -279,7 +279,7 @@ local function boot(opts)
     if unit == "player" and filter == "HELPFUL" then return w.auras[name] end end }
   w.PR = {}
   for _, file in ipairs({ "Plugin", "Lib", "Widgets", "Core", "Reequip", "Profiles", "SpellbookOpener", "Editor",
-                             "Settings", "ErrorText", "Options" }) do
+                             "Settings", "ErrorText", "Sounds", "Options" }) do
     local chunk = assert(loadfile("PriorityRotationDUI/" .. file .. ".lua"))
     chunk("PriorityRotationDUI", w.PR)
   end
@@ -1029,6 +1029,32 @@ do
   boot({ db = { enabled = true, profiles = {} } })
   check("18f) nothing chosen: nothing written", next(calls) == nil)
   _G.UIErrorsFrame = nil
+end
+
+-- 2026-11-25: Mute Sounds (Sounds.lua). Chosen groups are muted at login and at once on a change; a group is only
+-- unmuted after this addon muted it. DISCRIMINATION: with ApplySoundMutes dropped from OnEnable, 19a fails; from
+-- the SettingChanged handler, 19c fails; with the `muted[g.id]` check dropped from the unmute branch, 19b fails.
+out("P19) Mute Sounds")
+do
+  local muted, unmuted = {}, {}
+  _G.MuteSoundFile = function(id) muted[id] = (muted[id] or 0) + 1 end
+  _G.UnmuteSoundFile = function(id) unmuted[id] = (unmuted[id] or 0) + 1 end
+  local w = boot({ db = { enabled = true, profiles = {} }, settings = { muteSound_fizzle = true } })
+  check("19a) chosen groups muted at login", muted[569772] == 1 and muted[569776] == 1 and muted[562388] == nil)
+  check("19b) nothing unmuted that this addon never muted", next(unmuted) == nil)
+  SetOption("muteSound_yawns", true)
+  check("19c) switched on: muted at once", muted[562388] == 1)
+  SetOption("muteSound_fizzle", false)
+  check("19d) switched off: unmuted at once, its own mutes only", unmuted[569772] == 1 and unmuted[562388] == nil)
+  SetOption("muteSound_yawns", true)
+  check("19e) switched on again while on: not muted twice", muted[562388] == 1)
+  local mod = _G.__duiModules.PriorityRotationDUI
+  local page
+  for _, p in ipairs(mod and mod.options.pages or {}) do if p.id == "sounds" then page = p end end
+  check("19f) a Sounds page: nine switches, off to start", page and #page.groups[1].items == 9
+        and mod.defaults.muteSound_chimes == false)
+  _G.MuteSoundFile, _G.UnmuteSoundFile = nil, nil
+  local _ = w
 end
 
 out(("=== %d passed, %d failed ==="):format(pass, fail))

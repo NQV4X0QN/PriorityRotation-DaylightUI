@@ -22,4 +22,5 @@ SpellbookOpener.lua
 Editor.lua
 Settings.lua
 ErrorText.lua
+Sounds.lua
 Options.lua
