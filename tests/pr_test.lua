@@ -195,6 +195,7 @@ local function boot(opts)
     f.CreateTexture = function(self, ...)
       local t = mktex(self, ...)
       rawset(t, "SetAtlas", function(_, a) w.atlases[a] = (w.atlases[a] or 0) + 1 end)
+      rawset(t, "SetSize", function(self, w2, h) rawset(self, "_w", w2); rawset(self, "_h", h) end)
       return t
     end
     f.SetHighlightAtlas = function(_, a) w.atlases[a] = (w.atlases[a] or 0) + 1 end
@@ -647,6 +648,11 @@ do
   local shown = 0
   for _, row in ipairs(ed and ed.rows or {}) do if row._shown ~= false then shown = shown + 1 end end
   check("6j) an empty rotation shows one line to add to", shown == 1, shown)
+  -- Owner, 2026-11-25: the class art was zoomed in (drawn 1.15x its opening, as DaylightUI's unit frames do). Its
+  -- windows show the whole picture at the opening's size. DISCRIMINATION: 46 x 46 (the 1.15 fill) fails 6k.
+  local art = win and win.portraitArt
+  check("6k) the class art is the portrait's size, 40 x 40, not zoomed in", art and rawget(art, "_w") == 40
+        and rawget(art, "_h") == 40, art and tostring(rawget(art, "_w")))
 end
 out("P7) drag a slot to reorder (v1.35.11, replaced the up/down arrows)")
 do

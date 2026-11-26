@@ -42,7 +42,6 @@ UI.PICKED = 0.16
 UI.ICON_EDGE = { 0.23, 0.23, 0.26 }
 UI.BAND = { 0.10, 0.09, 0.065 }   -- Style.BAND (DaylightUI/Style.lua:297): the shell's warm band
 UI.MASK = "Interface\\CharacterFrame\\TempPortraitAlphaMask"
-UI.CLASS_FILL = 1.15             -- its class art is drawn this much larger than the round opening (UnitFrames.lua)
 
 local WHITE = "Interface\\Buttons\\WHITE8X8"
 
@@ -103,17 +102,26 @@ function UI.Window(spec)
     win.tabs, win.tab, win.reacqSwitch = {}, false, false
     API.Skin(win, { window = true })
 
-    -- The portrait: its class art in a round opening with the rim around it.
+    -- The portrait: its class art the size of the round opening, masked round, the whole picture shown, with the
+    -- rim around it -- as its spellbook window's header shows the class (Book/Window.lua classIcon: the art at
+    -- texcoords 0-1 in Win.Header's 40 px portrait, masked with TempPortraitAlphaMask, Windows/Frame.lua:173-180).
+    -- Not its unit frames' 1.15 fill, which zoomed the picture in (owner, 2026-11-25).
     local E = UI.EDGE
     local hole = CreateFrame("Frame", nil, win)
     hole:SetSize(UI.PORTRAIT, UI.PORTRAIT)
     hole:SetPoint("TOPLEFT", win, "TOPLEFT", E, -8)
     local art = hole:CreateTexture(nil, "ARTWORK")
-    local big = UI.PORTRAIT * UI.CLASS_FILL
-    art:SetSize(big, big)
+    art:SetSize(UI.PORTRAIT, UI.PORTRAIT)
     art:SetPoint("CENTER", hole, "CENTER", 0, 0)
+    art:SetTexCoord(0, 1, 0, 1)
     local file = UI.ClassArt()
     if file then art:SetTexture(file) end
+    local mask = hole.CreateMaskTexture and hole:CreateMaskTexture()
+    if mask then
+        mask:SetTexture(UI.MASK, "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
+        mask:SetAllPoints(art)
+        art:AddMaskTexture(mask)
+    end
     local rim = hole:CreateTexture(nil, "OVERLAY")
     if API.Media then rim:SetTexture(API.Media("portrait-rim.png")) end
     rim:SetPoint("TOPLEFT", hole, "TOPLEFT", -3, 3)
