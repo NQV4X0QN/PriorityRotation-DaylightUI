@@ -165,6 +165,6 @@ f:RegisterEvent("ADDON_LOADED")
 f:SetScript("OnEvent", function(self, _, name)
     if name ~= ADDON then return end
     self:UnregisterAllEvents()
-    local db = _G.PriorityRotationDUIDB
+    local db = _G.DaylightPriorityRotationDB
     PR.HideErrorTypes(type(db) == "table" and db.hiddenErrors or nil)
 end)

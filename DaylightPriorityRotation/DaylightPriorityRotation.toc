@@ -8,10 +8,10 @@
 ## X-Curse-Project-ID: 1832101
 ## Dependencies: DaylightUI
 ## OptionalDeps: VeritasUI_PriorityRotation
-## SavedVariables: PriorityRotationDUIDB
-## AddonCompartmentFunc: PriorityRotationDUI_OnAddonCompartmentClick
+## SavedVariables: DaylightPriorityRotationDB
+## AddonCompartmentFunc: DaylightPriorityRotation_OnAddonCompartmentClick
 ## Category: DaylightUI Plugins
-## Group: PriorityRotationDUI
+## Group: DaylightPriorityRotation
 
 Plugin.lua
 Lib.lua

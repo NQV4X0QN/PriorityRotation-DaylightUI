@@ -26,7 +26,7 @@ local function DaylightStub(opts)
   _G.__duiHandlers, _G.__duiModules, _G.__duiPlugins = {}, {}, {}
   _G.DaylightUI = {
     API = { major = 1, minor = 16,
-      GetSetting = function(scope, key) if scope == "PriorityRotationDUI" then return _G.__duiSettings[key] end end,
+      GetSetting = function(scope, key) if scope == "DaylightPriorityRotation" then return _G.__duiSettings[key] end end,
       For = function() return {
         On = function(ev, fn) _G.__duiHandlers[ev] = _G.__duiHandlers[ev] or {}; table.insert(_G.__duiHandlers[ev], fn) end,
         RegisterSkin = function() return false end,
@@ -55,7 +55,7 @@ end
 -- A change on its options page, as DaylightUI reports it.
 local function SetOption(key, value)
   _G.__duiSettings[key] = value
-  for _, fn in ipairs(_G.__duiHandlers.SettingChanged or {}) do fn("PriorityRotationDUI", key, value) end
+  for _, fn in ipairs(_G.__duiHandlers.SettingChanged or {}) do fn("DaylightPriorityRotation", key, value) end
 end
 
 local function boot(opts)
@@ -271,7 +271,7 @@ local function boot(opts)
   _G.C_Item.GetItemSubClassInfo = function(c, s)
     for _, i in pairs(w.items) do if i.class == c and i.subclass == s then return i.sub end end end
 
-  _G.PriorityRotationDUIDB = opts.db
+  _G.DaylightPriorityRotationDB = opts.db
   -- Skip a buff you already have (2026-11-12): w.auras[name] = { expirationTime = n } (0 = no end); w.now = clock.
   w.auras, w.now = opts.auras or {}, 1000
   _G.GetTime = function() return w.now end
@@ -280,17 +280,17 @@ local function boot(opts)
   w.PR = {}
   for _, file in ipairs({ "Plugin", "Lib", "Widgets", "Core", "Reequip", "Profiles", "SpellbookOpener", "Editor",
                              "Settings", "ErrorText", "Sounds", "AutoEquip", "Options" }) do
-    local chunk = assert(loadfile("PriorityRotationDUI/" .. file .. ".lua"))
-    chunk("PriorityRotationDUI", w.PR)
+    local chunk = assert(loadfile("DaylightPriorityRotation/" .. file .. ".lua"))
+    chunk("DaylightPriorityRotation", w.PR)
   end
   local function fire(ev, ...)
     for _, f in ipairs(_G.__evframes[ev] or {}) do if f._OnEvent then f._OnEvent(f, ev, ...) end end
   end
   w.fire = fire
-  fire("ADDON_LOADED", "PriorityRotationDUI")
+  fire("ADDON_LOADED", "DaylightPriorityRotation")
   if _G.__afterAddonLoaded then _G.__afterAddonLoaded() end   -- a suite's look at the state before any login
   -- DaylightUI turns its modules on in its own PLAYER_LOGIN, before the plugin's.
-  local mod = _G.__duiModules.PriorityRotationDUI
+  local mod = _G.__duiModules.DaylightPriorityRotation
   if mod and mod.OnEnable then mod.OnEnable(mod) end
   if opts.profile then
     w.PR.db.profiles[w.PR:GetProfileKey()] = opts.profile
@@ -300,7 +300,7 @@ local function boot(opts)
   w.runTimers()
 
   function w.said(p) for _, l in ipairs(w.log) do if l:find(p, 1, true) then return l end end end
-  function w.slash(msg) _G.SlashCmdList["PRDUI"](msg) ; w.runTimers() end
+  function w.slash(msg) _G.SlashCmdList["DAYLIGHTPR"](msg) ; w.runTimers() end
   -- One physical press through the WrapScript pre-body: down then up.
   function w.press()
     local body = w.rotBtn._wrap.body
@@ -392,12 +392,12 @@ do
   check("switched on there: on now", w.PR:IsEnabled() == true and w.said("Enabled.") ~= nil)
   SetOption("rotationOn", false)
   check("and off again", w.PR:IsEnabled() == false and w.said("Disabled.") ~= nil)
-  local mod = _G.__duiModules.PriorityRotationDUI
+  local mod = _G.__duiModules.DaylightPriorityRotation
   check("one options page with the switch and an open button", mod and mod.options.pages[1]
         and mod.options.pages[1].groups[1].items[1].key == "rotationOn"
         and mod.options.pages[1].groups[1].items[2].type == "button")
   check("registered as a plugin that states the API version it needs",
-        _G.__duiPlugins.PriorityRotationDUI and _G.__duiPlugins.PriorityRotationDUI.needs[1] == 1)
+        _G.__duiPlugins.DaylightPriorityRotation and _G.__duiPlugins.DaylightPriorityRotation.needs[1] == 1)
 end
 ----------------------------------------------------------------------------------------------
 out("P3) bar slots map to the real bars")
@@ -1018,7 +1018,7 @@ do
   SetOption("hideErrors_mail", true)
   check("18d) a change on the options page is kept for the next load", w.PR.db.hiddenErrors.mail == true
         and w.PR.db.hiddenErrors.spells == nil)
-  local mod = _G.__duiModules.PriorityRotationDUI
+  local mod = _G.__duiModules.DaylightPriorityRotation
   local page
   for _, p in ipairs(mod and mod.options.pages or {}) do if p.id == "errors" then page = p end end
   local rows = page and page.groups[1].items or {}
@@ -1048,7 +1048,7 @@ do
   check("19d) switched off: unmuted at once, its own mutes only", unmuted[569772] == 1 and unmuted[562388] == nil)
   SetOption("muteSound_yawns", true)
   check("19e) switched on again while on: not muted twice", muted[562388] == 1)
-  local mod = _G.__duiModules.PriorityRotationDUI
+  local mod = _G.__duiModules.DaylightPriorityRotation
   local page
   for _, p in ipairs(mod and mod.options.pages or {}) do if p.id == "sounds" then page = p end end
   check("19f) a Sounds page: nine switches, off to start", page and #page.groups[1].items == 9
@@ -1062,7 +1062,7 @@ end
 out("P20) Auto Equip on the Gear page")
 do
   local w = boot({ db = { enabled = true, profiles = {} } })
-  local mod = _G.__duiModules.PriorityRotationDUI
+  local mod = _G.__duiModules.DaylightPriorityRotation
   local page
   for _, p in ipairs(mod and mod.options.pages or {}) do if p.id == "gear" then page = p end end
   local rows = page and page.groups[1].items or {}

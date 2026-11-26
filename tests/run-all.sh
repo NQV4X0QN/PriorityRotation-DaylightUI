@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 LUA=/opt/homebrew/opt/lua@5.4/bin/lua
 LUAC=/opt/homebrew/opt/lua@5.4/bin/luac
-ADDON=PriorityRotationDUI
+ADDON=DaylightPriorityRotation
 status=0
 
 for f in "$ADDON"/*.lua; do

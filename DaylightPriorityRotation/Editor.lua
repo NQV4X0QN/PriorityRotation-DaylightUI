@@ -565,7 +565,7 @@ function PR:BuildEditor(page)
     local foot = UI.Footer(page)
     editor.foot = foot
     foot.Set({
-        { text = "Scan & Bind", primary = true, onClick = function() SlashCmdList["PRDUI"]("scan") end },
+        { text = "Scan & Bind", primary = true, onClick = function() SlashCmdList["DAYLIGHTPR"]("scan") end },
         { text = "Clear All Spells", onClick = function()
             PR:CurrentProfile().spells = {}
             PR:CompileSequence()

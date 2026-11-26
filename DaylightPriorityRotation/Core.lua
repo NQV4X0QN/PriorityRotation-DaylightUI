@@ -1088,10 +1088,10 @@ end)
 ----------------------------------------------------------------
 --  Slash Commands
 ----------------------------------------------------------------
-SLASH_PRDUI1 = "/pr"
-SLASH_PRDUI2 = "/priorityrotation"
+SLASH_DAYLIGHTPR1 = "/pr"
+SLASH_DAYLIGHTPR2 = "/priorityrotation"
 
-SlashCmdList["PRDUI"] = function(msg)
+SlashCmdList["DAYLIGHTPR"] = function(msg)
     local cmd = strtrim(msg or ""):lower()
 
     if cmd == "settings" then
@@ -1428,8 +1428,8 @@ function PR.SwitchSpec(i)
 end
 
 -- ── Addon Compartment (minimap dropdown) ────────────────────
-function PriorityRotationDUI_OnAddonCompartmentClick()
-    C_Timer.After(0, function() SlashCmdList["PRDUI"]("") end)
+function DaylightPriorityRotation_OnAddonCompartmentClick()
+    C_Timer.After(0, function() SlashCmdList["DAYLIGHTPR"]("") end)
 end
 
 -- Hovering our entry in the minimap AddOns menu opens a flyout of this character's specs.

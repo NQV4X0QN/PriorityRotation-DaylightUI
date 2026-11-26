@@ -37,8 +37,8 @@ end
 
 -- ── Database ─────────────────────────────────────────────────
 function PR:InitDB()
-    PriorityRotationDUIDB = PriorityRotationDUIDB or {}
-    local db = PriorityRotationDUIDB
+    DaylightPriorityRotationDB = DaylightPriorityRotationDB or {}
+    local db = DaylightPriorityRotationDB
     db.profiles = db.profiles or {}
     if db.enabled == nil then db.enabled = true end
     self.db = db

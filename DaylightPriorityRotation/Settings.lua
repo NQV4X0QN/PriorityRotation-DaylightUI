@@ -90,7 +90,7 @@ local function BuildSettingsPage(page, win)
     -- to Blizzard's menu-bar spellbook button; PR.ToggleSpellBookPanel only explains when the overlay is absent.
     local foot = UI.Footer(page)
     foot.Set({
-        { text = "Create Macro", primary = true, onClick = function() SlashCmdList["PRDUI"]("macro") end },
+        { text = "Create Macro", primary = true, onClick = function() SlashCmdList["DAYLIGHTPR"]("macro") end },
         { text = "Spellbook", onClick = function() PR.ToggleSpellBookPanel() end },
         { text = "Macros", onClick = function() PR.ToggleMacroPanel() end },
     })

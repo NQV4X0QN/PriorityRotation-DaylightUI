@@ -1,8 +1,8 @@
-package-as: PriorityRotationDUI
+package-as: DaylightPriorityRotation
 
 # The repo root holds the addon folder; ship it at the zip's root.
 move-folders:
-  PriorityRotationDUI/PriorityRotationDUI: PriorityRotationDUI
+  DaylightPriorityRotation/DaylightPriorityRotation: DaylightPriorityRotation
 
 ignore:
   - README.md

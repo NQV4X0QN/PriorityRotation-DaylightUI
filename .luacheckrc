@@ -1,4 +1,4 @@
--- .luacheckrc -- Priority Rotation (DaylightUI Plugin). Run from the repo root: luacheck PriorityRotationDUI tests
+-- .luacheckrc -- Priority Rotation (DaylightUI Plugin). Run from the repo root: luacheck DaylightPriorityRotation tests
 -- WoW runs a Lua 5.1 base; the game's API is layered on as read_globals. The list is VeritasUI's (this code came
 -- from there) plus DaylightUI.
 
@@ -8,9 +8,9 @@ max_line_length = false
 -- Globals this addon must define: its saved variables, slash command names, the AddOn compartment callback, the
 -- secure button and window names Blizzard looks up by name, and Blizzard tables it adds KEYS to.
 globals = {
-    "PriorityRotationDUIDB",
-    "SLASH_PRDUI1", "SLASH_PRDUI2", "SlashCmdList",
-    "PriorityRotationDUI_OnAddonCompartmentClick",
+    "DaylightPriorityRotationDB",
+    "SLASH_DAYLIGHTPR1", "SLASH_DAYLIGHTPR2", "SlashCmdList",
+    "DaylightPriorityRotation_OnAddonCompartmentClick",
     "UIPanelWindows",
 }
 

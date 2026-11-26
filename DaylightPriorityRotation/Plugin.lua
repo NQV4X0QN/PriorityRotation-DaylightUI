@@ -39,8 +39,8 @@ ns.HasLists = HasLists
 -- Copies VeritasUI's Priority Rotation data into this plugin's when this plugin has no spell lists yet. Returns
 -- true when it copied.
 function ns.ImportFromVeritasUI(from)
-    if not HasLists(from) or HasLists(_G.PriorityRotationDUIDB) then return false end
-    _G.PriorityRotationDUIDB = DeepCopy(from)
+    if not HasLists(from) or HasLists(_G.DaylightPriorityRotationDB) then return false end
+    _G.DaylightPriorityRotationDB = DeepCopy(from)
     return true
 end
 

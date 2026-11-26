@@ -97,7 +97,7 @@ local lines = {}
 local PR = { VUI = { IS_FOREVER = true, Print = function(_, msg) lines[#lines + 1] = msg end } }
 PR.GetOption = function(k) return _G.__aedb and _G.__aedb[k] end
 _G.UnitClass = function() return "Hunter", "HUNTER" end
-assert(loadfile("PriorityRotationDUI/AutoEquip.lua"))("PriorityRotationDUI", PR)
+assert(loadfile("DaylightPriorityRotation/AutoEquip.lua"))("DaylightPriorityRotation", PR)
 local function run() lines = {}; PR.EquipCheck() end
 local function line(name) for _, l in ipairs(lines) do if l:find(name, 1, true) then return l end end end
 
