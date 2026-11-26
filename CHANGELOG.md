@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1] - 2026-11-25
+
+### Fixed
+
+- Rotation — **your class art in the window's corner shows the whole picture**, as in DaylightUI's own windows
+- Rotation — **the empty line under your abilities reads in full**: "Drag a spell, macro or trinket here"
+
 ## [1.0.0] - 2026-11-25
 
 The first release: a one-button rotation for WoW: Forever, built on DaylightUI.
