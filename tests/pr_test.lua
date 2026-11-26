@@ -30,7 +30,24 @@ local function DaylightStub(opts)
       For = function() return {
         On = function(ev, fn) _G.__duiHandlers[ev] = _G.__duiHandlers[ev] or {}; table.insert(_G.__duiHandlers[ev], fn) end,
         RegisterSkin = function() return false end,
-      } end },
+      } end,
+      -- The look calls (API.md "Look like Daylight UI"): frames and font strings of the stubbed client, with
+      -- what the suite reads back recorded on them.
+      Skin = function(f, o) f._skin = o; return f end,
+      Text = function(parent, size) local fs = parent:CreateFontString(); rawset(fs, "_size", size); return fs end,
+      Button = function(parent, text, h) local b = CreateFrame("Button", nil, parent)
+        b.text = b:CreateFontString(); b.text:SetText(text or ""); b._h = h
+        b.SetOff = function(off) b._off = off end; b.SetGlow = function() end; return b end,
+      MainButton = function(b, on) b._main = on ~= false; return true end,
+      Close = function(parent, fn) local b = CreateFrame("Button", nil, parent); b._close = fn; return b end,
+      Switch = function(parent) local b = CreateFrame("Button", nil, parent)
+        b.SetOn = function(on) b._on = on end; return b end,
+      Colors = function() return { VALUE = { 1, 1, 1 }, TEXT = { .9, .9, .9 }, LABEL = { .7, .6, .5 },
+        OFF = { .4, .4, .4 }, GOOD = { 0, 1, 0 }, WARN = { 1, .8, 0 }, BAD = { 1, 0, 0 } } end,
+      Accent = function() return 0.4, 0.6, 1 end,
+      ClassColor = function() return 0.78, 0.61, 0.43 end,
+      Media = function(f) return "media:" .. f end,
+    },
     RegisterPlugin = function(_, name, o) _G.__duiPlugins[name] = o end,
     RegisterModule = function(_, name, def) _G.__duiModules[name] = def; return def end,
   }
@@ -170,6 +187,10 @@ local function boot(opts)
     w.frames[#w.frames + 1] = f
     f.SetPoint = function(self, ...) self._points = self._points or {}; self._points[#self._points + 1] = { ... } end
     f.SetText = function(self, t) self._text = t end
+    f.SetSize = function(self, w2, h) self._w, self._h = w2, h end
+    f.SetShown = function(self, s) self._shown = s and true or false end
+    f.Show = function(self) self._shown = true end
+    f.Hide = function(self) self._shown = false end
     local mktex = f.CreateTexture
     f.CreateTexture = function(self, ...)
       local t = mktex(self, ...)
@@ -257,7 +278,7 @@ local function boot(opts)
   _G.C_UnitAuras = { GetAuraDataBySpellName = function(unit, name, filter)
     if unit == "player" and filter == "HELPFUL" then return w.auras[name] end end }
   w.PR = {}
-  for _, file in ipairs({ "Plugin", "Lib", "Look", "Core", "Reequip", "Profiles", "SpellbookOpener", "Editor",
+  for _, file in ipairs({ "Plugin", "Lib", "Widgets", "Core", "Reequip", "Profiles", "SpellbookOpener", "Editor",
                              "Settings", "Options" }) do
     local chunk = assert(loadfile("PriorityRotationDUI/" .. file .. ".lua"))
     chunk("PriorityRotationDUI", w.PR)
@@ -585,47 +606,47 @@ do
 end
 
 _G.print = out
-out("P6) the window: Blizzard frame, no explainer paragraph, column tooltips (v1.35.11)")
+-- 2026-11-25 (owner: the window "doesn't quite fit in with the rest of DaylightUI"): the window is built from
+-- DaylightUI's public look calls and laid out like its trainer window (Widgets.lua). DISCRIMINATION: the
+-- 8f0ca40 window (Blizzard's ButtonFrameTemplate skinned afterwards) fails 6a, 6b, 6c and 6h.
+out("P6) the window: DaylightUI's window look, laid out like its trainer window")
 do
   local w = boot({ db = nil })
-  check("window built without error", not w.said("Editor error"), w.said("Editor error"))
-  check("ButtonFrameTemplate window", w.window ~= nil and w.window._tmpl == "ButtonFrameTemplate")
-  check("flat Auction House background in the Inset",
-        w.window and rawget(w.window, "Inset") and w.window.Inset.Bg._atlas == "auctionhouse-background-index")
-  local function anyText(p) for _, t in ipairs(w.texts) do if t:find(p, 1, true) then return t end end end
-  check("no explainer paragraph on the Rotation tab", anyText("Drag spells") == nil, anyText("Drag spells"))
-  check("no Rotation Columns section on the Settings tab", anyText("Rotation Columns") == nil)
-  local tips = w.PR.Editor and w.PR.Editor.headerTips or {}
+  local win = w.PR.MainWindow
+  check("6a) window built without error, in DaylightUI's window shell", win and not w.said("Editor error")
+        and win._skin and win._skin.window == true, w.said("Editor error"))
+  check("6b) the trainer window's size, 440 x 540", win and win._w == 440 and win._h == 540,
+        win and (tostring(win._w) .. "x" .. tostring(win._h)))
+  local BLIZZ = { ButtonFrameTemplate = true, PortraitFrameTemplate = true, PanelTabButtonTemplate = true,
+                  LargeSideTabButtonTemplate = true, UICheckButtonTemplate = true, MagicButtonTemplate = true,
+                  WowStyle1DropdownTemplate = true }
+  local used
+  for _, f in ipairs(w.frames) do if f._tmpl and BLIZZ[f._tmpl] then used = f._tmpl end end
+  check("6c) no Blizzard window templates", used == nil, used)
+  local tabs = win and win.tabs or {}
+  check("6d) two header tabs, Rotation then Settings", #tabs == 2 and tabs[1].id == "editor" and tabs[2].id == "settings")
+  local p = tabs[2] and tabs[2]._points and tabs[2]._points[#tabs[2]._points] or {}
+  check("6e) the last tab sits 14 left of the X", p[1] == "RIGHT" and p[2] == win.close and p[3] == "LEFT" and p[4] == -14)
+  local cp = win and win.close._points and win.close._points[1] or {}
+  check("6f) the X at TOPRIGHT -9, -15", cp[1] == "TOPRIGHT" and cp[4] == -9 and cp[5] == -15)
+  check("6g) Rotation starts picked", tabs[1] and tabs[1].picked == true and not tabs[2].picked
+        and win.pages.editor and win.pages.settings)
+  local ed = w.PR.Editor
+  local tips = ed and ed.headerTips or {}
   local n = 0
-  for _, k in ipairs({ "#", "Icon", "Ability", "Frequency", "After", "Combat" }) do
+  for _, k in ipairs({ "Rotation", "Frequency", "After", "Combat" }) do
     if type(tips[k]) == "string" and #tips[k] > 20 then n = n + 1 end
   end
-  check("every column header has a tooltip", n == 6, n)
-  local scan
-  for _, f in ipairs(w.frames) do if rawget(f, "_text") == "Scan & Bind" then scan = f end end
-  local inBar = false
-  for _, p in ipairs(scan and scan._points or {}) do
-    if p[1] == "BOTTOMRIGHT" and p[2] == w.window and p[3] == "BOTTOMRIGHT" then inBar = true end
-  end
-  check("Scan & Bind sits in the bottom bar, bottom right", inBar)
-  -- Settings tab: equal left and right margins (owner, 2026-10-30). The first section header sits
-  -- MARGIN in from the tab's left edge; the dividers stop MARGIN short of its right edge.
-  local hdr = w.fsPoints["How It Works"] or {}
-  local firstX = hdr[1] and hdr[1][4]
-  check("Settings tab: first section starts 4 px in", firstX == 4, firstX)
-  -- Blizzard's mount-list row art (owner, v1.35.11): every row and the sequence card.
-  check("the rows use the mount list's dark block", (w.atlases["PetList-ButtonBackground"] or 0) == 11,
-        w.atlases["PetList-ButtonBackground"])
-  check("no row hover highlight (it flickered across the row's controls)",
-        (w.atlases["PetList-ButtonHighlight"] or 0) == 0, w.atlases["PetList-ButtonHighlight"])
-  local borders = 0
-  for _, row in ipairs(w.PR.Editor and rawget(w.PR.Editor, "rows") or {}) do
-    if row.followBtn and rawget(row.followBtn, "border") then borders = borders + 1 end
-    if row.iconBtn and rawget(row.iconBtn, "border") then borders = borders + 1 end
-  end
-  check("every icon box, Icon and After, has the bags' slot border", borders == 20, borders)
+  check("6h) every column is named over its controls, each with a tooltip", n == 4 and ed.captions
+        and ed.captions.Frequency and ed.captions.After and ed.captions.Combat, n)
+  local main
+  for _, b in ipairs(ed and ed.foot.buttons or {}) do if b._main then main = b.text and b.text._t end end
+  local function label(b) for _, t in ipairs(w.texts) do if t == "Scan & Bind" then return t end end end
+  check("6i) Scan & Bind is the Rotation page's main button", ed and ed.foot.buttons[1]._main == true and label())
+  local shown = 0
+  for _, row in ipairs(ed and ed.rows or {}) do if row._shown ~= false then shown = shown + 1 end end
+  check("6j) an empty rotation shows one line to add to", shown == 1, shown)
 end
-
 out("P7) drag a slot to reorder (v1.35.11, replaced the up/down arrows)")
 do
   local w = boot({ db = nil })
@@ -634,7 +655,7 @@ do
   local ed = w.PR.Editor
   check("editor exposes its reorder", ed and type(ed.StartReorder) == "function" and type(ed.FinishReorder) == "function")
   if ed and rawget(ed, "rows") then
-  -- Lay the ten rows out on screen: 38 px tall, 4 px apart, top row at y=1000.
+  -- Lay the ten lines out on screen: 38 px apart, top line at y=1000.
   for k, row in ipairs(ed.rows) do
     local top = 1000 - (k - 1) * 42
     row.GetTop, row.GetBottom = function() return top end, function() return top - 38 end
@@ -664,17 +685,6 @@ do
   check("dropped where it started: nothing moves", names() == "Bravo,Charlie,Alpha", names())
   ed:StartReorder(5); ed:FinishReorder()
   check("an empty slot cannot be dragged", names() == "Bravo,Charlie,Alpha", names())
-  check("the arrows are gone", rawget(ed.rows[1], "moveUpBtn") == nil and rawget(ed.rows[1], "moveCol") == nil)
-  -- Frequency arrows: Blizzard's Journeys arrow, disabled at the limits (owner, 2026-10-30).
-  -- The ONE-STEP arrow (-big-), not the double jump-to-end arrow (-small-) (owner, 2026-10-30).
-  check("Journeys one-step arrow art on the frequency arrows",
-        (w.atlases["ui-journeys-delve-arrow-big-left"] or 0) >= 40
-        and (w.atlases["ui-journeys-delve-arrow-big-left-pressed"] or 0) == 20
-        and (w.atlases["ui-journeys-delve-arrow-big-left-disable"] or 0) == 20
-        and (w.atlases["ui-journeys-delve-arrow-small-left"] or 0) == 0,
-        w.atlases["ui-journeys-delve-arrow-big-left-pressed"])
-  check("empty slots use the bags' modern empty-slot art",
-        (w.atlases["bags-item-slot64"] or 0) == 20, w.atlases["bags-item-slot64"])
   local enabled = {}
   local row1 = ed.rows[1]
   row1.decBtn.SetEnabled = function(_, v) enabled.dec = v end
@@ -717,53 +727,26 @@ do
   check("9c) no spec at all: the class", w.PR:GetCurrentSpecLabel() == "Hunter", w.PR:GetCurrentSpecLabel())
 end
 
--- v1.67.4 (owner, 2026-11-05): WoW Forever windows carry icon tabs down the right edge. DISCRIMINATION: VeritasUI
--- v1.67.3 built two PanelTabButtonTemplate tabs there, so 10a-10e fail.
-out("P10) icon tabs on the right")
+-- The header tabs switch pages; the Settings page keeps the Spellbook and Macros buttons and has no Reset to Spec
+-- Defaults (a new profile starts empty) and no spec switcher (Forever has one specialization per class).
+-- DISCRIMINATION: with ActivateTab not showing the picked page, 10b fails.
+out("P10) header tabs and the Settings page")
 do
-  local function count(w, tmpl) local n = 0; for _, f in ipairs(w.frames) do if f._tmpl == tmpl then n = n + 1 end end; return n end
-  local w = boot({ db = nil })
-  local t = w.sideTabs or {}
-  check("10a) Forever: two side tabs, no bottom tabs", #t == 2 and count(w, "PanelTabButtonTemplate") == 0, #t)
-  local p1 = t[1] and t[1]._points and t[1]._points[1] or {}
-  check("10b) first tab on the window's right edge, 30 down (Forever's Character frame)",
-        p1[1] == "TOPLEFT" and p1[2] == w.window and p1[3] == "TOPRIGHT" and p1[4] == 0 and p1[5] == -30)
-  local p2 = t[2] and t[2]._points and t[2]._points[1] or {}
-  check("10c) second tab 2 below the first", p2[1] == "TOPLEFT" and p2[2] == t[1] and p2[3] == "BOTTOMLEFT" and p2[5] == -2)
-  check("10d) each has an icon, filled to the tab, and a tooltip",
-        t[1] and t[1].Icon._tex and t[2].Icon._tex and t[1]._fill and t[1].tooltipText == "Rotation"
-        and t[2].tooltipText == "Settings")
-  check("10e) Rotation starts selected", t[1] and t[1].SelectedTexture._shown == true and t[2].SelectedTexture._shown == false)
-  if t[2] then t[2]._mouseUp(t[2], "LeftButton", false) end
-  check("10f) a mouse-up released off the tab does nothing", t[1] and t[1].SelectedTexture._shown == true)
-  if t[2] then t[2]._mouseUp(t[2], "LeftButton", true) end
-  check("10g) a click on Settings selects it", t[2] and t[2].SelectedTexture._shown == true and t[1].SelectedTexture._shown == false)
-  -- v1.73.0 (owner: a window opened beside Priority Rotation covered its tabs). DISCRIMINATION: v1.72.0 sets no
-  -- extraWidth -> 10h fails.
+  local w = boot({ db = nil, specs = 3 })
+  local win = w.PR.MainWindow
+  local tabs = win and win.tabs or {}
+  if tabs[2] and tabs[2]._OnClick then tabs[2]._OnClick(tabs[2]) end
+  check("10a) a click on Settings picks it", tabs[2] and tabs[2].picked == true and not tabs[1].picked)
+  check("10b) and shows its page instead of Rotation's", win.pages.settings._shown == true
+        and win.pages.editor._shown == false)
+  local function has(t) for _, s in ipairs(w.texts) do if s == t then return true end end end
+  check("10c) Create Macro, Spellbook and Macros on its footer", has("Create Macro") and has("Spellbook") and has("Macros"))
+  check("10d) no Reset to Spec Defaults, no spec switcher", not has("Reset to Spec Defaults")
+        and not has("Switch Specialization"))
+  check("10e) the auto-target switch follows the spec's profile", win.reacqSwitch and win.reacqSwitch._on == false)
   local entry = _G.UIPanelWindows and _G.UIPanelWindows.PriorityRotMainWindow
-  check("10h) Forever: the panel slot keeps Blizzard's 82 for the tabs (Character frame padding)",
-        entry and entry.extraWidth == 82, entry and tostring(entry.extraWidth))
-  -- Owner, 2026-11-07: Professions (pushable 1) must take the far left. DISCRIMINATION: pushable 0 -> 10i fails.
-  check("10i) pushable 2: sorted after Professions (1), before Character Info (3)", entry and entry.pushable == 2,
+  check("10f) pushable 2: sorted after Professions (1), before Character Info (3)", entry and entry.pushable == 2,
         entry and tostring(entry.pushable))
-end
-
--- Audit 2026-11-09 P2/P3: WoW Forever has one specialization per class and a new profile there starts empty, so
--- the Settings tab's spec switcher had nothing to switch to and Reset to Spec Defaults did what Clear All Spells
--- does. DISCRIMINATION (measured): VeritasUI v1.84.0 builds both in Forever -> 11b and 11c fail.
-out("P11) Settings tab: no spec switcher with one spec, no Reset to Spec Defaults")
-do
-  local function dropdowns(w) local n = 0
-    for _, f in ipairs(w.frames) do if f._tmpl == "WowStyle1DropdownTemplate" then n = n + 1 end end; return n end
-  local function button(w, text)
-    for _, f in ipairs(w.frames) do if f._text == text then return f end end end
-  local r = boot({ db = nil, specs = 3 })
-  check("11a) two or more specs: the spec switcher", dropdowns(r) == 1, dropdowns(r))
-  local f = boot({ db = nil, specs = 1 })
-  check("11b) one spec: no spec switcher", dropdowns(f) == 0, dropdowns(f))
-  check("11c) Forever: no Reset to Spec Defaults, Clear All Spells stays", button(f, "Reset to Spec Defaults") == nil
-        and button(f, "Clear All Spells") ~= nil)
-  check("11d) Forever: the Spellbook and Macros buttons stay", button(f, "Spellbook") and button(f, "Macros"))
 end
 
 out("P12) a rotation press puts your weapons back after fishing (WoW Forever pole in the main hand)")

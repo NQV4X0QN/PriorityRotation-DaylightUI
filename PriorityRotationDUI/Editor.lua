@@ -1,17 +1,8 @@
--- ============================================================
--- PriorityRotation — Editor.lua
--- Drag-and-drop spell list with freq spinner and sequence preview.
--- ============================================================
+-- Priority Rotation (DaylightUI Plugin) / Editor.lua
+-- The Rotation page: the ability list (drop, drag to reorder, Frequency, After, Combat) and the compiled sequence.
 local _, PR = ...
 local VUI = PR.VUI
 if not VUI then return end
-
-local ICON_SZ = 28
-local ROW_H   = 38
--- Left edge of a row's dark block: past the slot number (4+18) and icon (5+28), plus a 3 px gap
--- -- the mount list's icon-outside-the-block layout. (The move arrows that sat between number and
--- icon were replaced by drag-to-reorder in v1.35.11.)
-local BLOCK_X = 4 + 18 + 5 + ICON_SZ + 3
 
 -- Spellbook / Macro toggles, shared by empty rotation slots and the Settings-tab buttons.
 --
@@ -228,335 +219,248 @@ local function HandleDrop(slotIndex)
     PR:SaveCurrentProfile()
     if PR.Editor then PR.Editor:Refresh() end
 end
+-- ── Build the editor ─────────────────────────────────────────
+-- The Rotation page, laid out like DaylightUI's trainer page (Widgets.lua has the measurements): a ROTATION
+-- section, one line per ability and one empty line to drop the next one on, a COMPILED SEQUENCE section, and the
+-- footer. Each line keeps the three controls the rotation needs at its right: Frequency (the arrows and the
+-- number), After (the box of the channelled spell it waits for) and Combat (a switch).
+local UI = PR.UI
+local API = PR.API
 
--- The bags' slot border around every icon box, empty or filled (owner, 2026-10-30): an
--- ItemButton's NormalTexture, Interface\Buttons\UI-Quickslot2, drawn 64 px on a 37 px button and
--- 1 px low (Blizzard_ItemButton/Shared/ItemButtonTemplate.xml:70-75), scaled to `size`. OVERLAY,
--- so it frames the icon the same way whether a slot is empty or filled.
-local function SlotBorder(btn, size)
-    local border = btn:CreateTexture(nil, "OVERLAY")
-    border:SetTexture("Interface\\Buttons\\UI-Quickslot2")
-    local sz = math.floor(size * 64 / 37 + 0.5)
-    border:SetSize(sz, sz)
-    border:SetPoint("CENTER", btn, "CENTER", 0, -1)
-    return border
+local CTRL = { switchW = 30, switchH = 16, afterW = 24, freqW = 52, arrow = 16, gap = 14, right = 8 }
+
+-- Its chevron (DaylightUI Media ui-chevron.png, pointing down) turned to point left or right, as its tree rows
+-- turn it (Parts.lua paintChevron: a quarter turn).
+local function Arrow(parent, facingRight)
+    local b = CreateFrame("Button", nil, parent)
+    b:SetSize(CTRL.arrow, CTRL.arrow)
+    local t = b:CreateTexture(nil, "ARTWORK")
+    if API.Media then t:SetTexture(API.Media("ui-chevron.png")) end
+    t:SetSize(10, 10)
+    t:SetPoint("CENTER")
+    t:SetRotation(facingRight and (math.pi / 2) or (-math.pi / 2))
+    b.art = t
+    function b.Paint(over)
+        UI.Ink(t, b:IsEnabled() and (over and "VALUE" or "LABEL") or "OFF")
+    end
+    b:SetScript("OnEnter", function() b.Paint(true) end)
+    b:SetScript("OnLeave", function() b.Paint(false) end)
+    hooksecurefunc(b, "SetEnabled", function() b.Paint(b:IsMouseOver() == true) end)
+    b.Paint(false)
+    return b
 end
 
--- ── Build the editor ─────────────────────────────────────────
-function PR:BuildEditor(parent, contentWidth)
-    local W = contentWidth or parent:GetWidth()
-    if W < 1 then W = 362 end
+-- The After box: a small icon slot, an edge like the line's icon, the LFG lock for Only After.
+local function AfterBox(parent)
+    local b = CreateFrame("Button", nil, parent)
+    b:SetSize(CTRL.afterW, CTRL.afterW)
+    b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    b.edge = UI.Tex(b, "ARTWORK", UI.ICON_EDGE)
+    b.edge:SetAllPoints(b)
+    b.well = UI.Tex(b, "ARTWORK", { 0.063, 0.063, 0.071, 1 }, 1)
+    b.well:SetPoint("TOPLEFT", b, "TOPLEFT", 1, -1)
+    b.well:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -1, 1)
+    b.tex = b:CreateTexture(nil, "OVERLAY")
+    b.tex:SetPoint("TOPLEFT", b, "TOPLEFT", 1, -1)
+    b.tex:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -1, 1)
+    UI.CropIcon(b.tex)
+    b.tex:Hide()
+    b.lock = b:CreateTexture(nil, "OVERLAY", nil, 7)
+    b.lock:SetAtlas("LFG-lock")
+    b.lock:SetSize(9, 11)
+    b.lock:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", 2, -2)
+    b.lock:Hide()
+    local hl = UI.Tex(b, "HIGHLIGHT", { 1, 1, 1, 0.12 })
+    hl:SetPoint("TOPLEFT", b, "TOPLEFT", 1, -1)
+    hl:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -1, 1)
+    return b
+end
+
+-- What the line's sub text says about an entry: what kind of thing it is, what it waits for, when it casts.
+local function SubText(e, spells)
+    local bits = {}
+    if e.macroName then bits[#bits + 1] = "Macro"
+    elseif e.itemID then bits[#bits + 1] = "Trinket" end
+    if e.channel then bits[#bits + 1] = "Channelled" end
+    local target = FindEntryByKey(e.follows, spells)
+    if target then
+        local word = e.followOnly and "Only after " or "After "
+        bits[#bits + 1] = word .. EntryDisplayName(target) .. (target.channel and "" or " (not seen channelling yet)")
+    end
+    if e.combatOnly and not e.macroName then bits[#bits + 1] = "In combat only" end
+    return table.concat(bits, " · ")
+end
+
+function PR:BuildEditor(page)
     local editor = {}
+    local list = UI.List(page, 10, UI.FOOT)
+    local W = list.width
+    local child = list.child
 
-    -- No explainer paragraph above the rows (removed v1.35.11, owner's request): each column
-    -- header explains itself in a tooltip (HEADER_TIPS below), and an empty slot's tooltip says
-    -- what to drag onto it.
-    --
-    -- Divider below the header-label row. Column headers themselves are
-    -- created AFTER the row loop so they can anchor to row 1's components
-    -- and stay column-aligned automatically (the 26px drop leaves room for
-    -- the header fontstrings above divLine).
-    local divLine = parent:CreateTexture(nil, "ARTWORK")
-    divLine:SetHeight(1)
-    divLine:SetPoint("TOPLEFT", parent, "TOPLEFT", 8, -26)
-    -- Right end matches the rows' right edge (rows start 4 px left of this line
-    -- and are W-12 wide, so both end 8 px inside the panel). The left end is
-    -- inset 8 px too so the line sits evenly between the borders (owner's
-    -- request): the rows' 4 px left inset holds the "#" column, not the line.
-    divLine:SetWidth(W - 16)
-    divLine:SetColorTexture(0.35, 0.35, 0.35, 0.9)
+    local HEADER_TIPS = {
+        Rotation    = "Your rotation, in order. Drag an ability up or down to move it. Drag a spell from your "
+                      .."spellbook, a macro from /macro or a trinket from your character pane onto the empty line "
+                      .."below it, and right-click an ability to remove it.",
+        Frequency   = "How often an ability is attempted relative to the others, spread as evenly as "
+                      .."the numbers allow. 5 = attempted almost constantly (short cooldowns, spenders); "
+                      .."1 = attempted rarely. It sets the spacing, not a literal count: back-to-back "
+                      .."presses of the same ability are collapsed, so a high frequency buys shorter gaps "
+                      .."rather than more steps. A not-ready attempt is skipped harmlessly, so err on the "
+                      .."high side for important abilities.",
+        After       = "Casts an ability on the next press after a channelled spell finishes, such as "
+                      .."Essence Break after Eye Beam. Click the box to pick the spell. Right-click "
+                      .."for Only After (the lock): the ability is then held for it and never cast on "
+                      .."its own.",
+        Combat      = "Only cast in combat. Leave your opener off so a key press can start the "
+                      .."fight. Macros have no switch: what they do is up to the macro.",
+    }
+    editor.headerTips = HEADER_TIPS
+    local function Tip(owner, title, text)
+        GameTooltip:SetOwner(owner, "ANCHOR_TOP")
+        GameTooltip:SetText(title, HIGHLIGHT_FONT_COLOR:GetRGB())
+        GameTooltip:AddLine(text, NORMAL_FONT_COLOR.r, NORMAL_FONT_COLOR.g, NORMAL_FONT_COLOR.b, true)
+        GameTooltip:Show()
+    end
 
-    -- ── Control-column grid (Frequency / After / Combat) ─────────
-    -- The identity cluster (#, icon, name) is a compact left-
-    -- aligned unit ending at x=212; the three CONTROL columns to its right
-    -- sit on a computed grid. Geometry is exact, not eyeballed: PNL_W=420 →
-    -- CONTENT_W=402 (Settings.lua) → ROW_W=390.
-    --
-    -- The eye judges gaps between VISIBLE edges — for the spinner that's
-    -- the arrow ART (inset 4px inside its frame: 20px buttons, art centered
-    -- ±10), not the invisible frame edge. With unequal element widths, even
-    -- center-spacing and even gaps are mutually exclusive (the mismatch
-    -- equals the half-width difference), so: the spinner is narrowed to 56
-    -- (arrows tuck in beside the number instead of floating) and the three
-    -- gaps — spinner→After, After→Combat, Combat→border — are split equal:
-    -- 25/25/26 at the live width. Headers sit on true element centers.
-    local ROW_W  = W - 12
-    local FREQ_L = 216                        -- name ends 212 + 4 gap
-    local FREQ_W, AFTER_W, CHK_W = 56, 24, 22
-    local FREQ_VIS_R = FREQ_L + FREQ_W - 4    -- inc-arrow art right edge
-    local CTL_GAP = math.floor((ROW_W - FREQ_VIS_R - AFTER_W - CHK_W) / 3)
-    if CTL_GAP < 4 then CTL_GAP = 4 end
-    local AFTER_L = FREQ_VIS_R + CTL_GAP
-    local CHK_L   = AFTER_L + AFTER_W + CTL_GAP
+    -- Where the three controls sit, from the line's right edge in.
+    local switchR = CTRL.right
+    local afterR  = switchR + CTRL.switchW + CTRL.gap
+    local freqR   = afterR + CTRL.afterW + CTRL.gap
 
-    -- ── Rows ─────────────────────────────────────────────────
+    -- ── The ROTATION section, with the three control columns named over their controls ──
+    local sec = UI.Section(child)
+    sec:SetWidth(W)
+    local function Caption(text, rightOff, width)
+        local fs = API.Text(sec, "small", "CENTER")
+        fs:SetPoint("BOTTOM", sec, "BOTTOMRIGHT", -(rightOff + width / 2), 4)
+        fs:SetText(text)
+        UI.Ink(fs, "LABEL")
+        local hit = CreateFrame("Frame", nil, sec)
+        hit:SetPoint("TOPLEFT", fs, "TOPLEFT", -4, 3)
+        hit:SetPoint("BOTTOMRIGHT", fs, "BOTTOMRIGHT", 4, -3)
+        hit:EnableMouse(true)
+        hit:SetScript("OnEnter", function(self) UI.Ink(fs, "VALUE"); Tip(self, text, HEADER_TIPS[text]) end)
+        hit:SetScript("OnLeave", function() UI.Ink(fs, "LABEL"); GameTooltip:Hide() end)
+        return fs
+    end
+    editor.captions = {
+        Frequency = Caption("Frequency", freqR, CTRL.freqW),
+        After     = Caption("After", afterR, CTRL.afterW),
+        Combat    = Caption("Combat", switchR, CTRL.switchW),
+    }
+    local secHit = CreateFrame("Frame", nil, sec)
+    secHit:SetPoint("TOPLEFT", sec.text, "TOPLEFT", -4, 3)
+    secHit:SetPoint("BOTTOMRIGHT", sec.text, "BOTTOMRIGHT", 4, -3)
+    secHit:EnableMouse(true)
+    secHit:SetScript("OnEnter", function(self) Tip(self, "Rotation", HEADER_TIPS.Rotation) end)
+    secHit:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    -- ── The lines ──────────────────────────────────────────────
     local rows = {}
-    -- Row 1 anchors 4 px left of divLine's start (divLine is inset 8, rows 4).
-    local prevAnchor, prevPt, prevOffX, prevOffY = divLine, "BOTTOMLEFT", -4, -4
-
-    for i = 1, PR.MAX_SLOTS do
-        local row = CreateFrame("Button", nil, parent)
-        row:SetSize(W - 12, ROW_H)
-        row:SetPoint("TOPLEFT", prevAnchor, prevPt, prevOffX, prevOffY)
-        row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-        prevAnchor, prevPt, prevOffX, prevOffY = row, "BOTTOMLEFT", 0, -4
-
-        row:SetScript("OnClick", function(_, btn)
-            if btn == "RightButton" then
-                local spells = PR:CurrentProfile().spells
-                if spells[i] then
-                    table.remove(spells, i)
-                    PR:SaveCurrentProfile()
-                    editor:Refresh()
-                end
+    editor.rows = rows
+    local function Remove(i)
+        local spells = PR:CurrentProfile().spells
+        if spells[i] then
+            table.remove(spells, i)
+            PR:SaveCurrentProfile()
+            editor:Refresh()
+        end
+    end
+    local function Click(i, btn)
+        if btn == "RightButton" then return Remove(i) end
+        local ct = GetCursorInfo()
+        if ct == "spell" or ct == "macro" or ct == "item" then
+            HandleDrop(i)
+        elseif not PR:CurrentProfile().spells[i] then
+            if IsShiftKeyDown() then ToggleMacroPanel() else ToggleSpellBookPanel() end
+        end
+    end
+    local function LineTip(self, i)
+        local e = PR:CurrentProfile().spells[i]
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        local hint = true
+        if e and e.spellID then
+            GameTooltip:SetSpellByID(e.spellID)
+        elseif e and e.itemID then
+            GameTooltip:SetItemByID(e.itemID)
+        elseif e and e.macroName then
+            local resolved = ExtractSpellFromMacro(e.macroName)
+            if resolved then
+                GameTooltip:SetSpellByID(resolved)
+                GameTooltip:AddLine(VUI.COL.LIGHTBLUE .. "Macro: " .. e.macroName .. "|r")
             else
-                local cursorType = GetCursorInfo()
-                if cursorType == "spell" or cursorType == "macro" or cursorType == "item" then
-                    HandleDrop(i)
-                elseif not PR:CurrentProfile().spells[i] then
-                    if IsShiftKeyDown() then ToggleMacroPanel() else ToggleSpellBookPanel() end
+                GameTooltip:AddLine("Macro: " .. e.macroName, HIGHLIGHT_FONT_COLOR:GetRGB())
+                local body = GetMacroBody(e.macroName)
+                if body and body ~= "" then
+                    GameTooltip:AddLine(body, NORMAL_FONT_COLOR.r, NORMAL_FONT_COLOR.g, NORMAL_FONT_COLOR.b, true)
                 end
             end
-        end)
+        else
+            hint = false
+            GameTooltip:AddLine("Empty slot", HIGHLIGHT_FONT_COLOR:GetRGB())
+            GameTooltip:AddLine("Click to toggle Spellbook · Shift-click to toggle Macros",
+                LIGHTBLUE_FONT_COLOR:GetRGB())
+            GameTooltip:AddLine("Drag a spell, macro, or trinket here to add it.", NORMAL_FONT_COLOR:GetRGB())
+        end
+        if hint then
+            GameTooltip:AddLine(" ")
+            GameTooltip:AddLine("Drag to move", HIGHLIGHT_FONT_COLOR:GetRGB())
+            GameTooltip:AddLine(VUI.COL.LIGHTBLUE .. "Right-click to remove|r")
+        end
+        GameTooltip:Show()
+    end
+
+    for i = 1, PR.MAX_SLOTS do
+        local row = UI.Line(child)
+        row:SetWidth(W)
+        row.slot = i
+        row:RegisterForDrag("LeftButton")
+        row:SetScript("OnClick", function(_, btn) Click(i, btn) end)
         row:SetScript("OnReceiveDrag", function() HandleDrop(i) end)
-        -- An empty slot opens the spellbook through the secure overlay (see ToggleSpellBookPanel).
+        row:SetScript("OnDragStart", function() editor:StartReorder(i) end)
+        row:SetScript("OnDragStop", function() editor:FinishReorder() end)
+        row:HookScript("OnEnter", function(self) LineTip(self, i) end)
+        row:HookScript("OnLeave", function() GameTooltip:Hide() end)
         if PR.SpellbookOpener then
             PR.SpellbookOpener.AddTarget(row, {
-                isActive = function() return not PR:CurrentProfile().spells[i] end,
+                isActive = function() return row:IsShown() and not PR:CurrentProfile().spells[i] end,
                 onDrop   = function() HandleDrop(i) end,
                 onShift  = function() ToggleMacroPanel() end,
             })
         end
 
-        -- ⚠ Blizzard's mount-list row (MountListButtonTemplate, Blizzard_Collections/Mainline/
-        -- Blizzard_MountCollection.xml:80-130): the dark block is the PetList-ButtonBackground atlas,
-        -- the icon sits outside it to the left, and PetList-ButtonHighlight lights it on hover
-        -- (owner's request, v1.35.11; was a hand-drawn dark fill with a 1 px amber border). Here the
-        -- slot number, arrows and icon stay left of the block; the block runs from just past the
-        -- icon (BLOCK_X) to the row's right edge, under the name and the three control columns.
-        local block = row:CreateTexture(nil, "BACKGROUND")
-        block:SetAtlas("PetList-ButtonBackground")
-        block:SetPoint("TOPLEFT",     row, "TOPLEFT",     BLOCK_X, 0)
-        block:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 0,       0)
-        -- No hover highlight (owner, 2026-10-30): the row's own controls take the mouse, so the
-        -- mount list's PetList-ButtonHighlight flickered off and on across the Frequency arrows.
-        -- Drag-to-reorder target marker: the mount list's selected-row frame (PetList-ButtonSelect).
-        local dropMark = row:CreateTexture(nil, "OVERLAY")
-        dropMark:SetAtlas("PetList-ButtonSelect")
-        dropMark:SetPoint("TOPLEFT",     block, "TOPLEFT",     0, 0)
-        dropMark:SetPoint("BOTTOMRIGHT", block, "BOTTOMRIGHT", 0, 0)
-        dropMark:Hide()
-        row.dropMark = dropMark
-        -- Kept for a restyling module (a retired VeritasUI one), which swapped the card for its own panel.
-        row.cardArt = { block }
-
-        -- Drag a filled slot by its block or its icon to move it (owner's request, v1.35.11;
-        -- replaced the up/down arrows). The game's own drag events: OnDragStart once the mouse
-        -- moves with the button held, OnDragStop on release, wherever the cursor is.
-        row:RegisterForDrag("LeftButton")
-        -- Says so on hover, so the drag can be found (owner, 2026-10-30).
-        row:SetScript("OnEnter", function(self)
-            local e = PR:CurrentProfile().spells[i]
-            if not e then return end
-            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-            GameTooltip:AddLine(EntryDisplayName(e), HIGHLIGHT_FONT_COLOR:GetRGB())
-            GameTooltip:AddLine("Drag to move", HIGHLIGHT_FONT_COLOR:GetRGB())
-            GameTooltip:AddLine(VUI.COL.LIGHTBLUE .. "Right-click to remove|r")
-            GameTooltip:Show()
-        end)
-        row:SetScript("OnLeave", function() GameTooltip:Hide() end)
-        row:SetScript("OnDragStart", function() editor:StartReorder(i) end)
-        row:SetScript("OnDragStop",  function() editor:FinishReorder() end)
-
-        local numLbl = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        numLbl:SetPoint("LEFT", row, "LEFT", 4, 0)
-        numLbl:SetWidth(18)
-        numLbl:SetText(i)
-        numLbl:SetTextColor(NORMAL_FONT_COLOR:GetRGB())   -- Blizzard gold (owner, 2026-11-01)
-        numLbl:SetJustifyH("CENTER")
-
-        -- Icon
-        local iconBtn = CreateFrame("Button", nil, row)
-        iconBtn:SetSize(ICON_SZ, ICON_SZ)
-        iconBtn:SetPoint("LEFT", numLbl, "RIGHT", 5, 0)
-        iconBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-        iconBtn:RegisterForDrag("LeftButton")
-        iconBtn:SetScript("OnDragStart", function() editor:StartReorder(i) end)
-        iconBtn:SetScript("OnDragStop",  function() editor:FinishReorder() end)
-
-        iconBtn.border = SlotBorder(iconBtn, ICON_SZ)
-
-        local emptyTex = iconBtn:CreateTexture(nil, "ARTWORK")
-        emptyTex:SetAllPoints()
-        emptyTex:SetAtlas("bags-item-slot64")   -- bags' empty slot (ContainerFrame.xml:80)
-        iconBtn.empty = emptyTex
-
-        local iconTex = iconBtn:CreateTexture(nil, "ARTWORK")
-        iconTex:SetAllPoints()
-        iconTex:Hide()
-        iconBtn.tex = iconTex
-
-        iconBtn:SetScript("OnReceiveDrag", function() HandleDrop(i) end)
-        iconBtn:SetScript("OnClick", function(_, btn)
-            -- Resolve the list once, as every sibling handler in this file does.
-            -- table.remove mutates in place, so the single local stays correct.
-            local spells = PR:CurrentProfile().spells
-            if btn == "RightButton" then
-                if spells[i] then
-                    table.remove(spells, i)
-                    PR:SaveCurrentProfile(); editor:Refresh()
-                end
-            else
-                local ct = GetCursorInfo()
-                if ct == "spell" or ct == "macro" or ct == "item" then HandleDrop(i)
-                elseif not spells[i] then
-                    if IsShiftKeyDown() then ToggleMacroPanel() else ToggleSpellBookPanel() end
-                end
-            end
-        end)
-        iconBtn:SetScript("OnEnter", function(self)
-            local e = PR:CurrentProfile().spells[i]
-            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-            if e and e.spellID then
-                GameTooltip:SetSpellByID(e.spellID)
-                GameTooltip:AddLine(" ")
-                GameTooltip:AddLine("Drag to move", HIGHLIGHT_FONT_COLOR:GetRGB())
-                GameTooltip:AddLine(VUI.COL.LIGHTBLUE .. "Right-click to remove|r")
-            elseif e and e.itemID then
-                -- Items use the standard Blizzard item tooltip with quality
-                -- header, ilvl, and use effect — same as hovering an item
-                -- in the character pane.
-                GameTooltip:SetItemByID(e.itemID)
-                GameTooltip:AddLine(" ")
-                GameTooltip:AddLine("Drag to move", HIGHLIGHT_FONT_COLOR:GetRGB())
-                GameTooltip:AddLine(VUI.COL.LIGHTBLUE .. "Right-click to remove|r")
-            elseif e and e.macroName then
-                local resolvedSpellID = ExtractSpellFromMacro(e.macroName)
-                if resolvedSpellID then
-                    GameTooltip:SetSpellByID(resolvedSpellID)
-                    GameTooltip:AddLine(" ")
-                    GameTooltip:AddLine(VUI.COL.LIGHTBLUE .. "Macro: " .. e.macroName .. "|r")
-                else
-                    GameTooltip:AddLine("Macro: " .. e.macroName, HIGHLIGHT_FONT_COLOR:GetRGB())
-                    local body = GetMacroBody(e.macroName)
-                    if body and body ~= "" then
-                        GameTooltip:AddLine(body, NORMAL_FONT_COLOR.r, NORMAL_FONT_COLOR.g, NORMAL_FONT_COLOR.b, true)
-                    end
-                end
-                GameTooltip:AddLine(" ")
-                GameTooltip:AddLine("Drag to move", HIGHLIGHT_FONT_COLOR:GetRGB())
-                GameTooltip:AddLine(VUI.COL.LIGHTBLUE .. "Right-click to remove|r")
-            else
-                GameTooltip:AddLine("Slot " .. i, HIGHLIGHT_FONT_COLOR:GetRGB())
-                GameTooltip:AddLine("Click to toggle Spellbook · Shift-click to toggle Macros",
-                    LIGHTBLUE_FONT_COLOR:GetRGB())
-                GameTooltip:AddLine("Drag a spell, macro, or trinket here to fill this slot.",
-                    NORMAL_FONT_COLOR:GetRGB())
-            end
-            GameTooltip:Show()
-        end)
-        iconBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-        row.iconBtn = iconBtn
-
-        -- Spell name
-        local nameLbl = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        nameLbl:SetPoint("LEFT", iconBtn, "RIGHT", 11, 0)   -- 8 px inside the block (owner: 4 more)
-        nameLbl:SetWidth(146)   -- ends at 212, where the control columns' grid starts (FREQ_L)
-        nameLbl:SetJustifyH("LEFT")
-        row.nameLbl = nameLbl
-
-        -- Frequency spinner (grid column 1)
-        local freqFrame = CreateFrame("Frame", nil, row)
-        freqFrame:SetSize(FREQ_W, ROW_H)
-        freqFrame:SetPoint("LEFT", row, "LEFT", FREQ_L, 0)
-        freqFrame:Hide()
-        row.freqFrame = freqFrame
-
-        local freqLbl = freqFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        freqLbl:SetPoint("CENTER")
-        freqLbl:SetTextColor(HIGHLIGHT_FONT_COLOR:GetRGB())
-        row.freqLbl = freqLbl
-
-        -- ⚠ THE STANDARD ARROW (owner, 2026-10-30): the Journeys renown track's ONE-STEP arrow
-        -- (RewardTrackButtonTemplate via RewardTrackArtButtonTemplate, Blizzard_FrameXML/
-        -- RewardTrackTemplates.xml:131-165) -- ui-journeys-delve-arrow-big-left with its -pressed /
-        -- -disable atlases, the same art added on top at 40% for hover. NOT the -small- atlases:
-        -- those are the double "jump to the start / end" arrow (RewardTrackJumpButtonTemplate).
-        -- Hover only brightens it; a click shifts it subtly. The right arrow is the left one
-        -- mirrored, as Blizzard does (RewardTrackArtButtonMixin:OnLoad, RewardTrackTemplates.lua
-        -- :255-262). Drawn at ARROW_W x ARROW_H, smaller than its 22x34 button, to fit the row.
-        -- Until v1.35.11 these swapped to a different arrow on hover, which jumped.
-        local ARROW_W, ARROW_H = 10, 15
-        local function JourneysArrow(btn, facingRight)
-            local function Tex(atlas, layer, alpha, blend)
-                local t = btn:CreateTexture(nil, layer)
-                t:SetAtlas(atlas)
-                t:SetSize(ARROW_W, ARROW_H)
-                t:SetPoint("CENTER")
-                if alpha then t:SetAlpha(alpha) end
-                if blend then t:SetBlendMode(blend) end
-                if facingRight then t:SetTexCoord(1, 0, 0, 1) end
-                return t
-            end
-            btn:SetNormalTexture(Tex("ui-journeys-delve-arrow-big-left", "ARTWORK"))
-            btn:SetPushedTexture(Tex("ui-journeys-delve-arrow-big-left-pressed", "ARTWORK"))
-            btn:SetDisabledTexture(Tex("ui-journeys-delve-arrow-big-left-disable", "ARTWORK"))
-            btn:SetHighlightTexture(Tex("ui-journeys-delve-arrow-big-left", "HIGHLIGHT", 0.4, "ADD"))
-        end
-
-        local decBtn = CreateFrame("Button", nil, freqFrame)
-        decBtn:SetSize(20, ROW_H)
-        decBtn:SetPoint("LEFT")
-        JourneysArrow(decBtn, false)
-        decBtn:SetScript("OnClick", function()
+        -- Frequency: the number between two arrows.
+        local freq = CreateFrame("Frame", nil, row)
+        freq:SetSize(CTRL.freqW, UI.LINE)
+        freq:SetPoint("RIGHT", row, "RIGHT", -freqR, 0)
+        local dec = Arrow(freq, false)
+        dec:SetPoint("LEFT", freq, "LEFT", 0, 0)
+        local inc = Arrow(freq, true)
+        inc:SetPoint("RIGHT", freq, "RIGHT", 0, 0)
+        local num = API.Text(freq, "body", "CENTER")
+        num:SetPoint("CENTER", freq, "CENTER", 0, 0)
+        UI.Ink(num, "VALUE")
+        dec:SetScript("OnClick", function()
             local e = PR:CurrentProfile().spells[i]
             if not e then return end
             e.freq = math.max(1, (e.freq or 1) - 1)
             PR:SaveCurrentProfile(); editor:Refresh()
         end)
-
-        local incBtn = CreateFrame("Button", nil, freqFrame)
-        incBtn:SetSize(20, ROW_H)
-        incBtn:SetPoint("RIGHT")
-        JourneysArrow(incBtn, true)
-        incBtn:SetScript("OnClick", function()
+        inc:SetScript("OnClick", function()
             local e = PR:CurrentProfile().spells[i]
             if not e then return end
             e.freq = math.min(5, (e.freq or 1) + 1)
             PR:SaveCurrentProfile(); editor:Refresh()
         end)
+        row.freqFrame, row.freqLbl, row.decBtn, row.incBtn = freq, num, dec, inc
+        row.right = freq
 
-        row.decBtn, row.incBtn = decBtn, incBtn
-
-        -- "After" (follows) button — shows the icon of the channelled spell this one waits for
-        -- (v1.36.0; the press snippet in Core.lua does the waiting). Left-click cycles through
-        -- the other entries that have been seen channelling, then back to none; right-click
-        -- switches between "also after" and "only after" (the LFG lock badge).
-        local followBtn = CreateFrame("Button", nil, row)
-        followBtn:SetSize(AFTER_W, AFTER_W)
-        followBtn:SetPoint("LEFT", row, "LEFT", AFTER_L, 0)   -- grid column 2
-        followBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-
-        local followEmpty = followBtn:CreateTexture(nil, "ARTWORK")
-        followEmpty:SetAllPoints()
-        followEmpty:SetAtlas("bags-item-slot64")   -- bags' empty slot (ContainerFrame.xml:80)
-        followBtn.empty = followEmpty
-        followBtn.border = SlotBorder(followBtn, AFTER_W)
-
-        local followTex = followBtn:CreateTexture(nil, "ARTWORK")
-        followTex:SetAllPoints()
-        followTex:Hide()
-        followBtn.tex = followTex
-
-        -- "Only after" badge: the LFG list's lock (17x21), half size in the bottom-right corner.
-        local followLock = followBtn:CreateTexture(nil, "OVERLAY", nil, 7)
-        followLock:SetAtlas("LFG-lock")
-        followLock:SetSize(9, 11)
-        followLock:SetPoint("BOTTOMRIGHT", followBtn, "BOTTOMRIGHT", 2, -2)
-        followLock:Hide()
-        followBtn.lock = followLock
-
-        followBtn:SetScript("OnClick", function(_, btn)
+        -- After: the box of the channelled spell this one waits for (v1.36.0; the press snippet in Core.lua does
+        -- the waiting). Left-click cycles through the other entries seen channelling, then back to none;
+        -- right-click switches between Also After and Only After.
+        local follow = AfterBox(row)
+        follow:SetPoint("RIGHT", row, "RIGHT", -afterR, 0)
+        follow:SetScript("OnClick", function(_, btn)
             local spells = PR:CurrentProfile().spells
             local e = spells[i]
             if not e then return end
@@ -564,10 +468,8 @@ function PR:BuildEditor(parent, contentWidth)
                 if not e.follows then return end
                 e.followOnly = (not e.followOnly) or nil
             else
-                -- Candidates: every OTHER channelled spell, by key, in profile order. Deduplicated
-                -- by key: e.follows stores a KEY, not a slot index, so two slots holding the same
-                -- ability are one candidate (without this the forward search below always matches
-                -- the FIRST duplicate and the cycle oscillates between two entries).
+                -- Candidates: every OTHER channelled spell, by key, in profile order, each key once (e.follows
+                -- stores a KEY, so two slots holding the same ability are one candidate).
                 local selfKey = PR.EntryKey(e)
                 local cands, seen = {}, {}
                 for j, o in ipairs(spells) do
@@ -588,33 +490,25 @@ function PR:BuildEditor(parent, contentWidth)
                 for idx, k in ipairs(cands) do
                     if k == e.follows then cur = idx; break end
                 end
-                -- none → first candidate → … → last candidate → none. A link to a target that is
-                -- not (yet) a candidate steps to the first candidate, or to none if there is none.
-                if cur then
-                    e.follows = cands[cur + 1]   -- nil past the end = none
-                else
-                    e.follows = cands[1]
-                end
+                -- none -> first candidate -> ... -> last -> none; a link to a non-candidate steps to the first.
+                if cur then e.follows = cands[cur + 1] else e.follows = cands[1] end
                 if not e.follows then e.followOnly = nil end
             end
             PR:SaveCurrentProfile(); editor:Refresh()
         end)
-        followBtn:SetScript("OnEnter", function(self)
+        follow:SetScript("OnEnter", function(self)
             local e = PR:CurrentProfile().spells[i]
             if not e then return end
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             local target = FindEntryByKey(e.follows)
             local me = EntryDisplayName(e)
             if target and target.channel then
-                -- Blizzard's tooltip colours (owner, 2026-11-01): title white, description gold.
                 GameTooltip:SetText(e.followOnly and "Only After" or "Also After", HIGHLIGHT_FONT_COLOR:GetRGB())
                 GameTooltip:AddLine(format(e.followOnly
                     and VUI.COL.HIGHLIGHT .. "%s|r is held until " .. VUI.COL.BRIGHTBLUE
-                        .. "%s|r finishes channelling, then cast"
-                        .. " on the next press. It is never cast on its own."
+                        .. "%s|r finishes channelling, then cast on the next press. It is never cast on its own."
                     or  VUI.COL.HIGHLIGHT .. "%s|r is cast on the next press after " .. VUI.COL.BRIGHTBLUE
-                        .. "%s|r finishes"
-                        .. " channelling, and also at its normal frequency.",
+                        .. "%s|r finishes channelling, and also at its normal frequency.",
                     me, EntryDisplayName(target)), NORMAL_FONT_COLOR.r, NORMAL_FONT_COLOR.g, NORMAL_FONT_COLOR.b, true)
             elseif target then
                 GameTooltip:SetText("After", HIGHLIGHT_FONT_COLOR:GetRGB())
@@ -633,212 +527,78 @@ function PR:BuildEditor(parent, contentWidth)
                 or "Click to pick", LIGHTBLUE_FONT_COLOR:GetRGB())
             GameTooltip:Show()
         end)
-        followBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-        row.followBtn = followBtn
+        follow:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        row.followBtn = follow
 
-        -- "Combat" (combat-only) checkbox — compiles [combat] into this entry's
-        -- conditional (spell/trinket entries only; macro bodies are user-owned
-        -- and untouched, so the box is hidden for macro entries). Replaces the
-        -- user's hand-macro [combat, nochanneling] convention. The entry left
-        -- unchecked is the opener: castable out of combat to start the fight.
-        local combatChk = CreateFrame("CheckButton", nil, row, "UICheckButtonTemplate")
-        combatChk:SetSize(CHK_W, CHK_W)
-        combatChk:SetPoint("LEFT", row, "LEFT", CHK_L, 0)     -- grid column 3
-        combatChk:SetScript("OnClick", function(self)
+        -- Combat: compiles [combat] into this entry's conditional (spells and trinkets only; a macro's body is the
+        -- player's own, so it has no switch). The entry left off is the opener.
+        local combat = API.Switch(row)
+        combat:SetPoint("RIGHT", row, "RIGHT", -switchR, 0)
+        combat:SetScript("OnClick", function(self)
             local e = PR:CurrentProfile().spells[i]
             if not e then return end
-            e.combatOnly = self:GetChecked() and true or nil
+            e.combatOnly = (not e.combatOnly) or nil
+            if self.SetOn then self.SetOn(e.combatOnly == true) end
             PR:SaveCurrentProfile(); editor:Refresh()
         end)
-        combatChk:SetScript("OnEnter", function(self)
-            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-            GameTooltip:AddLine("Combat only", HIGHLIGHT_FONT_COLOR:GetRGB())
-            GameTooltip:AddLine(
-                "Checked: compiled with " .. VUI.COL.HIGHLIGHT .. "[combat]|r — this ability only"
-                .. " casts while in combat. Leave your opener unchecked so a key"
-                .. " press out of combat can start the fight.",
-                    NORMAL_FONT_COLOR.r, NORMAL_FONT_COLOR.g, NORMAL_FONT_COLOR.b, true)
-            GameTooltip:Show()
+        combat:SetScript("OnEnter", function(self)
+            Tip(self, "Combat only", "On: compiled with " .. VUI.COL.HIGHLIGHT .. "[combat]|r -- this ability only"
+                .. " casts while in combat. Leave your opener off so a key press out of combat can start the fight.")
         end)
-        combatChk:SetScript("OnLeave", function() GameTooltip:Hide() end)
-        row.combatChk = combatChk
+        combat:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        row.combatChk = combat
 
         rows[i] = row
-        VUI.AnnounceFrame("PriorityRotation.EditorRow", row)
     end
 
-    -- ── Column headers ───────────────────────────────────────────────
-    -- All anchored to rows[1]'s TOPLEFT for a CONSISTENT vertical baseline
-    -- (anchoring to each column's TOP would put them at different heights
-    -- because column heights differ: iconBtn=28, freqFrame=38, text=~12).
-    --
-    -- X offsets are hardcoded to match the row-column layout above:
-    --   numLbl    LEFT=4,   width=18   → center=13
-    --   iconBtn   LEFT=27,  width=28   → center=41
-    --   nameLbl   LEFT=66,  width=146  → LEFT=66 (left-justified header)
-    -- The three control columns sit on the computed equal-gap grid
-    -- (FREQ_L / AFTER_L / CHK_L above) — headers center on element
-    -- centers derived from the same constants, so they stay aligned
-    -- for any panel width without hand-tuned offsets.
-    local HEADER_Y = 6
+    -- ── COMPILED SEQUENCE ──────────────────────────────────────
+    local seqSec = UI.Section(child)
+    seqSec:SetWidth(W)
+    seqSec.Set("Compiled sequence")
+    local seqText = API.Text(child, "small", "LEFT")
+    seqText:SetWidth(W)
+    seqText:SetWordWrap(true)
+    if seqText.SetSpacing then seqText:SetSpacing(3) end
+    UI.Ink(seqText, "TEXT")
+    editor.seqText = seqText
 
-    -- Each header explains its column on hover (v1.35.11). The wording is what the explainer
-    -- paragraph and the Settings tab's "Rotation Columns" section used to say.
-    local HEADER_TIPS = {
-        ["#"]       = "Your rotation's slots, in order. Drag a slot up or down to move it.",
-        Icon        = "Drag a spell from your spellbook, a macro from /macro or a trinket from your "
-                      .."character pane onto a slot. Right-click a slot to remove it.",
-        Ability     = "What is in the slot. " .. VUI.COL.LIGHTBLUE .. "[M]|r marks a macro, "
-            .. VUI.COL.NORMAL .. "[T]|r a trinket.",
-        Frequency   = "How often an ability is attempted relative to the others, spread as evenly as "
-                      .."the numbers allow. 5 = attempted almost constantly (short cooldowns, spenders); "
-                      .."1 = attempted rarely. It sets the spacing, not a literal count: back-to-back "
-                      .."presses of the same ability are collapsed, so a high frequency buys shorter gaps "
-                      .."rather than more steps. A not-ready attempt is skipped harmlessly, so err on the "
-                      .."high side for important abilities.",
-        After       = "Casts an ability on the next press after a channelled spell finishes, such as "
-                      .."Essence Break after Eye Beam. Click a slot's box to pick the spell. Right-click "
-                      .."for Only After (the lock): the ability is then held for it and never cast on "
-                      .."its own.",
-        Combat      = "Only cast in combat. Leave your opener unchecked so a key press can start the "
-                      .."fight. Macros have no box: what they do is up to the macro.",
-    }
-    local function AddHeaderTip(fs, text)
-        local tip = HEADER_TIPS[text]
-        if not tip then return end
-        local hit = CreateFrame("Frame", nil, parent)
-        hit:SetPoint("TOPLEFT",     fs, "TOPLEFT",     -4,  3)
-        hit:SetPoint("BOTTOMRIGHT", fs, "BOTTOMRIGHT",  4, -3)
-        hit:EnableMouse(true)
-        hit:SetScript("OnEnter", function(self)
-            GameTooltip:SetOwner(self, "ANCHOR_TOP")
-            -- Blizzard's tooltip colours (owner, 2026-11-01): the header's name white, its text gold.
-            GameTooltip:SetText(text == "#" and "Order" or text, HIGHLIGHT_FONT_COLOR:GetRGB())
-            GameTooltip:AddLine(tip, NORMAL_FONT_COLOR.r, NORMAL_FONT_COLOR.g, NORMAL_FONT_COLOR.b, true)
-            GameTooltip:Show()
-        end)
-        hit:SetScript("OnLeave", function() GameTooltip:Hide() end)
-        fs.tipHit = hit
-    end
-
-    local function MakeCenteredHeader(xOff, text)
-        local fs = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        fs:SetPoint("BOTTOM", rows[1], "TOPLEFT", xOff, HEADER_Y)
-        fs:SetTextColor(NORMAL_FONT_COLOR:GetRGB())   -- Blizzard gold (owner, 2026-11-01)
-        fs:SetText(text)
-        AddHeaderTip(fs, text)
-        return fs
-    end
-
-    MakeCenteredHeader(13,  "#")
-    MakeCenteredHeader(41,  "Icon")
-    local hAbility = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    hAbility:SetPoint("BOTTOMLEFT", rows[1], "TOPLEFT", 66, HEADER_Y)
-    hAbility:SetTextColor(NORMAL_FONT_COLOR:GetRGB())
-    hAbility:SetText("Ability")
-    AddHeaderTip(hAbility, "Ability")
-    MakeCenteredHeader(FREQ_L + FREQ_W / 2, "Frequency")
-    MakeCenteredHeader(AFTER_L + AFTER_W / 2, "After")
-    MakeCenteredHeader(CHK_L + CHK_W / 2, "Combat")
-    editor.headerTips = HEADER_TIPS
-
-    -- ── Sequence preview card ────────────────────────────────────
-    -- Wraps the "Compiled Sequence:" header + preview text in a card
-    -- with the rows' dark block art (PetList-ButtonBackground). Width is anchored to the last row's bottom
-    -- corners: the right edge matches the rows, the left is inset 4 (below). The bottom
-    -- edge anchors to parent's bottom so the card auto-fills the
-    -- remaining vertical space, providing room for the scrollable
-    -- preview text within. Empty rotation slots themselves accept
-    -- drag-and-drop (spells/macros/trinkets), so no dedicated drop
-    -- zone is needed — and the Spellbook / Macros buttons in the
-    -- Settings tab cover the "open spellbook" affordance.
-    local seqCard = CreateFrame("Frame", nil, parent)
-    -- Left wall inset 4 px past the rows' left edge so the card sits 8 px from
-    -- both panel borders (the right edge already matches the rows; owner's request).
-    seqCard:SetPoint("TOPLEFT",  rows[PR.MAX_SLOTS], "BOTTOMLEFT",  4, -8)
-    seqCard:SetPoint("TOPRIGHT", rows[PR.MAX_SLOTS], "BOTTOMRIGHT", 0, -8)
-    seqCard:SetPoint("BOTTOM",   parent,             "BOTTOM",      0,  4)
-
-    -- The same dark block as the rows (PetList-ButtonBackground), stretched to the card.
-    local seqFill = seqCard:CreateTexture(nil, "BACKGROUND")
-    seqFill:SetAtlas("PetList-ButtonBackground")
-    seqFill:SetAllPoints()
-    seqCard.cardArt = { seqFill }
-    VUI.AnnounceFrame("PriorityRotation.SequenceCard", seqCard)
-
-    -- Header at top of card with padding.
-    local seqHeader = seqCard:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    seqHeader:SetPoint("TOPLEFT", seqCard, "TOPLEFT", 6, -6)
-    seqHeader:SetText("Compiled Sequence:")   -- GameFontNormalSmall: Blizzard gold
-
-    -- Scrollable preview area — plain ScrollFrame with mousewheel.
-    -- MinimalScrollBar is designed for lists (AO Browser/Featured),
-    -- not single text blocks — WowScrollBoxList can't scroll WITHIN
-    -- a single oversized element, only BETWEEN elements. For a
-    -- wrapped paragraph, the bare ScrollFrame + mousewheel pattern
-    -- is cleaner and actually scrollable.
-    local seqScroll = CreateFrame("ScrollFrame", nil, seqCard)
-    seqScroll:SetPoint("TOPLEFT",     seqHeader, "BOTTOMLEFT",  0, -2)
-    seqScroll:SetPoint("BOTTOMRIGHT", seqCard,   "BOTTOMRIGHT", -8, 6)
-    seqScroll:EnableMouseWheel(true)
-
-    local seqScrollChild = CreateFrame("Frame", nil, seqScroll)
-    seqScrollChild:SetSize(1, 1)
-    seqScroll:SetScrollChild(seqScrollChild)
-
-    local function UpdateSeqScrollChildWidth()
-        local w = seqScroll:GetWidth()
-        if w and w > 0 then seqScrollChild:SetWidth(w) end
-    end
-    seqScroll:HookScript("OnSizeChanged", UpdateSeqScrollChildWidth)
-    C_Timer.After(0, UpdateSeqScrollChildWidth)
-
-    seqScroll:SetScript("OnMouseWheel", function(self, delta)
-        local cur = self:GetVerticalScroll() or 0
-        local max = self:GetVerticalScrollRange() or 0
-        local newVal = cur - (delta * 18)
-        if newVal < 0 then newVal = 0 end
-        if newVal > max then newVal = max end
-        self:SetVerticalScroll(newVal)
-    end)
-
-    local seqPreview = seqScrollChild:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    seqPreview:SetPoint("TOPLEFT",  seqScrollChild, "TOPLEFT",  0, 0)
-    seqPreview:SetPoint("TOPRIGHT", seqScrollChild, "TOPRIGHT", 0, 0)
-    seqPreview:SetJustifyH("LEFT")
-    seqPreview:SetTextColor(HIGHLIGHT_FONT_COLOR:GetRGB())   -- panel body: white (owner, 2026-11-01)
+    local foot = UI.Footer(page)
+    editor.foot = foot
+    foot.Set({
+        { text = "Scan & Bind", primary = true, onClick = function() SlashCmdList["PRDUI"]("scan") end },
+        { text = "Clear All Spells", onClick = function()
+            PR:CurrentProfile().spells = {}
+            PR:CompileSequence()
+            PR:RefreshUI()
+        end },
+    })
 
     -- ── Drag to reorder ──────────────────────────────────────
-    -- The slot under the cursor; above the first row counts as slot 1, below the last as the last
-    -- filled slot. Rows are fixed frames, so their screen bounds are read directly.
+    -- The line under the cursor; above the first counts as 1, below the last filled line as the last.
     local function SlotUnderCursor(numSpells)
+        if numSpells < 1 then return nil end
         local _, cy = GetCursorPosition()
         local scale = rows[1]:GetEffectiveScale()
         if not cy or not scale or scale == 0 then return nil end
         cy = cy / scale
-        local top1, bottomN = rows[1]:GetTop(), rows[PR.MAX_SLOTS]:GetBottom()
+        local top1, bottomN = rows[1]:GetTop(), rows[numSpells]:GetBottom()
         if top1 and cy > top1 then return 1 end
-        for k = 1, PR.MAX_SLOTS do
+        for k = 1, numSpells do
             local t, b = rows[k]:GetTop(), rows[k]:GetBottom()
-            -- Each row also owns the 4 px gap above it, so no point between rows is a dead zone.
-            if t and b and cy <= t + 4 and cy >= b then return math.min(k, numSpells) end
+            if t and b and cy <= t + UI.LINE_SPACE and cy >= b then return k end
         end
         if bottomN and cy < bottomN then return numSpells end
         return nil
     end
 
-    editor.rows = rows
-    local dragDriver = CreateFrame("Frame", nil, parent)
+    local dragDriver = CreateFrame("Frame", nil, page)
     dragDriver:Hide()
     local dragFrom, dragTo
-
     local function ShowMark(slot)
-        for k = 1, PR.MAX_SLOTS do rows[k].dropMark:SetShown(k == slot) end
+        for k = 1, PR.MAX_SLOTS do rows[k].Mark(k == slot) end
     end
-
     dragDriver:SetScript("OnUpdate", function()
-        local n = #PR:CurrentProfile().spells
-        dragTo = SlotUnderCursor(n) or dragTo
+        dragTo = SlotUnderCursor(#PR:CurrentProfile().spells) or dragTo
         ShowMark(dragTo)
     end)
 
@@ -871,7 +631,7 @@ function PR:BuildEditor(parent, contentWidth)
     end
 
     -- A drag cut short by the window closing ends without moving anything.
-    parent:HookScript("OnHide", function()
+    page:HookScript("OnHide", function()
         if dragFrom then
             dragDriver:Hide()
             rows[dragFrom]:SetAlpha(1)
@@ -880,119 +640,95 @@ function PR:BuildEditor(parent, contentWidth)
         end
     end)
 
-    -- ── Refresh ──────────────────────────────────────────────
+    local function SequenceText()
+        if #PR.compiledSequence == 0 then
+            local links = AfterLinksText()
+            return links ~= "" and links:gsub("^\n\n", "") or (UI.Hex("OFF") .. "Empty: add abilities above.|r")
+        end
+        local names = {}
+        for idx, cast in ipairs(PR.compiledSequence) do
+            local n = PR.compiledNames and PR.compiledNames[idx]
+            if n then
+                local mTag, iTag = n:match("^%[MACRO:(.-)%]$"), n:match("^%[ITEM:(.-)%]$")
+                names[#names + 1] = mTag and ("[M:" .. mTag .. "]") or iTag and ("[T:" .. iTag .. "]") or n
+            else
+                names[#names + 1] = cast:gsub("^/cast ", ""):gsub("^/use ", "")
+            end
+        end
+        return table.concat(names, " > ") .. AfterLinksText()
+    end
+
+    -- ── Refresh: fill the lines and lay the page out ──────────
     function editor:Refresh()
         local spells = PR:CurrentProfile().spells
+        local n = #spells
+        sec:ClearAllPoints()
+        sec:SetPoint("TOPLEFT", child, "TOPLEFT", 0, 0)
+        sec.Set("Rotation", nil)
+        local y = UI.SECTION_H
         for i = 1, PR.MAX_SLOTS do
-            local row = rows[i]
-            local e   = spells[i]
-            if e and (e.spellID or e.macroName or e.itemID) then
-                -- Refresh icon: for macros, re-read the current macro icon;
-                -- for items, refresh icon from C_Item.GetItemInfo (in case
-                -- the item got upgraded / changed quality).
-                local displayIcon = e.icon
+            local row, e = rows[i], spells[i]
+            local shown = i <= n + 1
+            row:SetShown(shown)
+            if shown then
+                y = y + UI.LINE_SPACE
+                row:ClearAllPoints()
+                row:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
+                y = y + UI.LINE
+            end
+            if shown and e and (e.spellID or e.macroName or e.itemID) then
+                -- A macro's icon is read again (it may have changed), and a trinket's (an upgrade).
+                local icon = e.icon
                 if e.macroName then
-                    local _, freshIcon = GetMacroInfo(e.macroName)
-                    if freshIcon then
-                        displayIcon = freshIcon
-                        e.icon = freshIcon
-                    end
+                    local _, fresh = GetMacroInfo(e.macroName)
+                    if fresh then icon = fresh; e.icon = fresh end
                 elseif e.itemID then
-                    -- C_Item.GetItemInfo may return Secret Values in raid
-                    -- encounters; guard the call. Refresh is purely cosmetic
-                    -- — failure silently keeps the cached e.icon.
-                    local ok, _, _, _, _, _, _, _, _, _, freshIcon =
-                        pcall(C_Item.GetItemInfo, e.itemID)
-                    if ok and freshIcon then
-                        displayIcon = freshIcon
-                        e.icon = freshIcon
-                    end
+                    local ok, _, _, _, _, _, _, _, _, _, fresh = pcall(C_Item.GetItemInfo, e.itemID)
+                    if ok and fresh then icon = fresh; e.icon = fresh end
                 end
-                row.iconBtn.tex:SetTexture(displayIcon)
-                row.iconBtn.tex:Show()
-                row.iconBtn.empty:Hide()
-                local displayName = e.spellName or e.macroName or e.itemName
-                if e.macroName then
-                    -- Light-blue [M] tag (LIGHTBLUE_FONT_COLOR since the v1.58 colour sweep; it was cyan).
-                    displayName = VUI.COL.LIGHTBLUE .. "[M]|r " .. e.macroName
-                elseif e.itemID then
-                    -- Gold [T] tag (NORMAL_FONT_COLOR) for "Trinket" — distinct from spells
-                    -- (no tag, white) and macros (light-blue [M]). The trinket
-                    -- name itself stays white for readability against the
-                    -- dark row background.
-                    displayName = VUI.COL.NORMAL .. "[T]|r " .. e.itemName
-                end
-                row.nameLbl:SetText(displayName)
+                row.Set({ icon = icon, text = e.spellName or e.macroName or e.itemName, sub = SubText(e, spells) })
                 row.freqLbl:SetText("x" .. (e.freq or 1))
-                -- At the limits the arrow shows Blizzard's disabled art and stops taking clicks.
                 row.decBtn:SetEnabled((e.freq or 1) > 1)
                 row.incBtn:SetEnabled((e.freq or 1) < 5)
                 row.freqFrame:Show()
-                -- "After" indicator: target's icon when the link resolves;
-                -- dimmed empty slot when unset (or the target was removed —
-                -- the stored key is kept, so re-adding the target relinks).
-                -- Grey icon: the target is there but not yet seen channelling (link inactive).
+                -- After: the target's icon when the link resolves, grey while it has not been seen channelling.
                 local target = FindEntryByKey(e.follows, spells)
                 if target and target.icon then
                     row.followBtn.tex:SetTexture(target.icon)
                     row.followBtn.tex:SetDesaturated(not target.channel)
                     row.followBtn.tex:Show()
-                    row.followBtn.empty:Hide()
                 else
                     row.followBtn.tex:Hide()
-                    row.followBtn.empty:Show()
                 end
                 row.followBtn.lock:SetShown(target and e.followOnly and true or false)
                 row.followBtn:Show()
-                -- Combat gate applies only to entries PR compiles itself
-                -- (spells/trinkets); macro bodies are user-owned, so no box.
                 if e.macroName then
                     row.combatChk:Hide()
                 else
-                    row.combatChk:SetChecked(e.combatOnly and true or false)
+                    if row.combatChk.SetOn then row.combatChk.SetOn(e.combatOnly == true) end
                     row.combatChk:Show()
                 end
-            else
-                row.iconBtn.tex:Hide()
-                row.iconBtn.empty:Show()
-                row.nameLbl:SetText(VUI.COL.DISABLED .. "-- empty --|r")
+            elseif shown then
+                row.Set({ text = "Add an ability", sub = "Drag a spell, macro or trinket here, or click for your spellbook",
+                    dim = true })
                 row.freqFrame:Hide()
                 row.followBtn:Hide()
                 row.combatChk:Hide()
             end
         end
-        if #PR.compiledSequence > 0 then
-            local displayNames = {}
-            for idx, cast in ipairs(PR.compiledSequence) do
-                local n = PR.compiledNames and PR.compiledNames[idx]
-                if n then
-                    -- Compact wrappers for the preview line:
-                    --   [MACRO:Name] → [M:Name]
-                    --   [ITEM:Name]  → [T:Name]
-                    local mTag = n:match("^%[MACRO:(.-)%]$")
-                    local iTag = n:match("^%[ITEM:(.-)%]$")
-                    if mTag then
-                        displayNames[#displayNames + 1] = "[M:" .. mTag .. "]"
-                    elseif iTag then
-                        displayNames[#displayNames + 1] = "[T:" .. iTag .. "]"
-                    else
-                        displayNames[#displayNames + 1] = n
-                    end
-                else
-                    displayNames[#displayNames + 1] = cast:gsub("^/cast ", ""):gsub("^/use ", "")
-                end
-            end
-            seqPreview:SetText(table.concat(displayNames, " > ") .. AfterLinksText())
-        else
-            local links = AfterLinksText()
-            seqPreview:SetText(links ~= "" and links:gsub("^\n\n", "")
-                or VUI.COL.GRAY .. "(empty -- add spells above)|r")
-        end
-        -- Resize the scroll child to fit the wrapped text so mousewheel
-        -- scrolling works when the sequence overflows the card.
-        seqScrollChild:SetHeight(math.max(seqPreview:GetStringHeight() + 4, 1))
+        y = y + UI.SECTION_GAP
+        seqSec:ClearAllPoints()
+        seqSec:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
+        y = y + UI.SECTION_H + 6
+        seqText:ClearAllPoints()
+        seqText:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
+        seqText:SetText(SequenceText())
+        local h = seqText:GetStringHeight()
+        y = y + ((type(h) == "number" and h > 0) and math.ceil(h) or 14) + 8
+        list:SetHeight(y)
     end
 
     PR.Editor = editor
+    editor:Refresh()   -- laid out before the window first shows
     return editor
 end
