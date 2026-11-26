@@ -1,42 +1,1477 @@
--- Priority Rotation (DaylightUI Plugin) / Core.lua
--- Registers the plugin and its module with DaylightUI through its public API (DaylightUI/API.md:
--- "A plugin of your own", "Put your settings on a Daylight UI page"). Nothing here touches
--- DaylightUI's internals. One line in chat, from DaylightUI, when its API is too old or another major.
+-- VeritasUI_PriorityRotation / Core.lua
+-- One-button rotation cycler with per-spec profiles and action bar override.
+--
+-- Contract: All functions that modify secure state check InCombatLockdown
+-- internally, so callers need not guard. Functions that only read state
+-- or modify Lua-side data do not check combat.
+--
+-- ┌─ TAINT CONTRACT ──────────────────────────────────────────────────────────┐
+-- │ Midnight 12.0 Secret Values: taint on any SecureActionButton propagates   │
+-- │ to its entire execution context. Blizzard's cooldown/combat code then     │
+-- │ throws "Secret values only allowed during untainted execution" in          │
+-- │ Delves, M+, and raids.                                                    │
+-- │                                                                            │
+-- │ NAMING: `rotBtn` is PR's OWN SecureActionButton, created tainted at        │
+-- │ load; nothing else shares its execution context, so PR writes its          │
+-- │ attributes freely (see rotBtn:SetAttribute at load and in                  │
+-- │ InjectSequence).  `btn` below means one of BLIZZARD's ActionButtons,       │
+-- │ whose context Blizzard's own cooldown code depends on.  The two are        │
+-- │ NOT interchangeable - that is the whole boundary this block guards.        │
+-- │                                                                            │
+-- │ SAFE from addon code:                                                      │
+-- │   rotBtn:Execute(...)           — runs in the secure restricted env        │
+-- │   SetOverrideBindingClick(...)  — does not touch button attributes         │
+-- │   icon:SetTexture(...)          — unprotected rendering property           │
+-- │                                                                            │
+-- │ NEVER from addon code:                                                     │
+-- │   btn:SetAttribute(...)         — taints the button's execution context    │
+-- │   btn.icon:Show() / Hide()      — taints ActionButton children             │
+-- │   any API call inside Execute() that touches protected game state          │
+-- │                                                                            │
+-- │ The secure execution core (WrapScript + newtable + Execute) is correct.   │
+-- │ All historical breakage has been code AROUND it crossing this boundary.   │
+-- └───────────────────────────────────────────────────────────────────────────┘
 
-local ADDON, ns = ...
+local ADDON_NAME, PR = ...
+local VUI = PR.VUI
+if not VUI then return end   -- Plugin.lua stopped (no DaylightUI API, or VeritasUI's Priority Rotation is on)
 
-local DUI = _G.DaylightUI
-local API = DUI and DUI.API
-if type(API) ~= "table" or API.major ~= 1 then return end
+----------------------------------------------------------------
+--  Localize hot globals
+----------------------------------------------------------------
+local ipairs          = ipairs
+local pcall, tonumber = pcall, tonumber
+local type, format    = type, string.format
+local tconcat         = table.concat
+local CreateFrame     = CreateFrame
+local C_Timer         = C_Timer
+local C_Spell         = C_Spell
+local InCombatLockdown = InCombatLockdown
+local GetActionInfo    = GetActionInfo
+local GetMacroIndexByName = GetMacroIndexByName
 
-ns.API = API
-ns.me = API.For(ADDON)
+----------------------------------------------------------------
+--  Constants
+----------------------------------------------------------------
+PR.VERSION          = VUI.VERSION
+PR.MAX_SLOTS        = 10
+PR.MAX_ACTION_SLOT  = 180   -- Action Bar 8 ends at slot 180 (page 15 x 12)
+PR.MACRO_NAME       = "Attack"
+PR.BUTTON_NAME      = "PRAttackButton"
+PR.compiledSequence = {}
+PR.compiledNames    = {}   -- step → display name, built during compile
+PR.overrides        = {}   -- [macroName] = { slot, keys } — populated by scan
+PR.debug            = false
+-- Diagnostic state — keys are the offending name/ID, value `true` means
+-- "we have already warned about this one this session".  Cleared when
+-- the underlying macro/spell becomes valid again so a subsequent
+-- delete-and-recompile re-warns.  Survives until /reload.
+PR._missingMacroWarned = {}
+PR._missingSpellWarned = {}
 
-ns.MODULE = ADDON
-ns.NEEDS = { 1, 3 }   -- Paint, hooks, texts and settings (API.md "The promise")
+----------------------------------------------------------------
+--  Debug output — gated on PR.debug; never clutters normal play.
+--  Toggle at runtime with /pr debug.
+----------------------------------------------------------------
+local function DebugPrint(msg)
+    if PR.debug then VUI.Print("Priority Rotation", VUI.COL.GRAY .. "[debug]|r " .. msg) end
+end
 
-DUI:RegisterPlugin(ADDON, {
-    needs = ns.NEEDS,
-    short = "Rotation",
-    color = "7fb2ff",
-    blurb = "A one-button rotation from a spell list you build.",
-})
+----------------------------------------------------------------
+--  "Cast on key down" is the player's: rotBtn sets its own `useOnKeyDown` attribute
+--  (SecureActionButton_ShouldUseOnKeyDown reads it before the ActionButtonUseKeyDown CVar,
+--  Blizzard_FrameXML/SecureTemplates.lua:795-803), so the CVar is never touched.
+----------------------------------------------------------------
 
-ns.defaults = {}
+----------------------------------------------------------------
+--  Scan scheduler — single cancellable handle, never piles up.
+--
+--  Any code path that needs to trigger a scan calls ScheduleScan.
+--  A pending scan is always cancelled before a new one is set, so
+--  only one scan timer exists at any given time. The callback
+--  re-checks InCombatLockdown so a scan never fires mid-combat
+--  regardless of when it was scheduled.
+----------------------------------------------------------------
+function PR:ScheduleScan(delay)
+    if self._scanTimer then self._scanTimer:Cancel() end
+    self._scanTimer = C_Timer.NewTimer(delay, function()
+        self._scanTimer = nil
+        if not InCombatLockdown() then
+            self:ScanAndOverrideBarButton()
+        elseif not self._scanQueued then
+            -- A bar or key change during combat (freshness review 2026-11-14): scan once it ends.
+            self._scanQueued = true
+            VUI.CombatQueue.Add(function() PR._scanQueued = false; PR:ScanAndOverrideBarButton() end)
+        end
+    end)
+end
 
-ns.pages = {
-    { id = "main", label = "Priority Rotation",
-      desc = "A one-button rotation: each press casts the next spell on your list that is ready.",
-      groups = {
-          { label = "Getting started", items = {
-              { type = "text", label = "The rotation, error message and sound settings arrive in the next builds." },
-          } },
-      } },
+----------------------------------------------------------------
+--  Secure Action Button
+----------------------------------------------------------------
+local rotBtn = CreateFrame("Button", PR.BUTTON_NAME, UIParent,
+    "SecureActionButtonTemplate,SecureHandlerBaseTemplate")
+rotBtn:SetAttribute("type", "macro")
+-- Act on key RELEASE for this button only, whatever the player's account-wide setting says
+-- (the CVar is the player's, see above).
+rotBtn:SetAttribute("useOnKeyDown", false)
+rotBtn:SetAttribute("step", 1)
+rotBtn:SetAttribute("macrotext", "")
+rotBtn:RegisterForClicks("AnyUp", "AnyDown")
+-- Must be shown for SetOverrideBindingClick to route clicks here.
+-- Parked off-screen at 1×1 px so it's functionally invisible.
+rotBtn:SetSize(1, 1)
+rotBtn:SetPoint("TOPLEFT", UIParent, "TOPLEFT", -10, 10)
+rotBtn:SetAlpha(0)
+rotBtn:Show()
+
+-- Initialize macros table immediately to prevent nil-access if
+-- a click arrives before the first InjectSequence call.
+PR.AFTER_PRESSES = 4
+rotBtn:Execute("macros = newtable(); macros[1] = ''; links = newtable(); armed = newtable(); nextLink = 0;"
+    .. " followerTurn = true; skip = newtable(); armPresses = " .. PR.AFTER_PRESSES
+    .. "; cap = newtable(); capUsed = newtable(); capN = 0")
+
+-- PARITY BUG (found 2026-07-11, latent since inception): the keybind path
+-- (SetOverrideBindingClick) delivers TWO clicks per physical press — key-down
+-- and key-up — and this wrap ran on both, advancing two steps per press while
+-- the cast fires only on the UP edge (this button's useOnKeyDown=false attribute;
+-- until v1.17.10 the account-wide ActionButtonUseKeyDown=0). Result: every other
+-- compiled step was silently discarded. The old clumping compiler masked it
+-- (consecutive duplicate steps put every spell in both parity classes); the
+-- v1.9.6 smooth-weave compiler exposed it as hard starvation — with an
+-- even-length cycle the executed parity is FIXED, and any ability living
+-- only on the other parity NEVER casts (observed in-game: Immolation Aura
+-- silent for 40s). The `down` argument is standard in secure OnClick
+-- snippets; gating on it consumes exactly one step per physical press, on
+-- the same edge that casts.
+--
+-- "After" links (v1.36.0) are decided here, per press, not in the compiled list.
+-- links[i] = { "[channeling:<target>] 1", <follower macrotext> }, Only After followers first.
+-- A press that lands while the target channels re-arms every link on it for PR.AFTER_PRESSES
+-- tries and otherwise steps as normal (its step carries [nochanneling], so it does nothing).
+-- After the channel, presses ALTERNATE: an armed follower (taking turns), then the normal
+-- rotation step, until every link's tries are spent. A follower still on cooldown just fails
+-- and waits for the next channel.
+-- WHY (measured 2026-10-31 with a temporary press log, four runs of 8-9 Eye Beams):
+--   * 2 tries each, back to back: all four landed inside ONE global cooldown, so whichever cast
+--     first left the other nothing (Essence Break missed 5 of the first 5).
+--   * 7 tries each, back to back (~1.5 s): Essence Break cast at every Eye Beam its cooldown
+--     allowed, but when both followers were on cooldown the character stood still ~1.5 s.
+--   Alternating with the rotation keeps both: the tries span more than one global cooldown, and
+--   every other press is a normal step.
+--   * Alternating (third run, 9 Eye Beams): Essence Break cast at every Eye Beam its cooldown
+--     allowed, but the character still stood ~1 s twice: the normal steps in the window were
+--     Eye Beam (just cast) and Blade Dance (on cooldown, and already being tried as a follower).
+--     So during the window the normal step skips skip[] — steps that are a link's target or a
+--     linked follower — and lands on something that can cast.
+--   * With the skip (fourth run, 9 Eye Beams): Essence Break cast after #1, #3, #5, #7, #9 (all its
+--     40 s cooldown allows at ~20 s Eye Beams), window steps were Immolation Aura / Chaos Strike /
+--     Throw Glaive, no idle; owner: "a lot more fluid". The snippet cannot see time
+--   (no GetTime in RestrictedEnvironment.lua), so the window is counted in presses.
+-- SecureCmdOptionParse is allowed in this environment (RestrictedEnvironment.lua:82); the
+-- 2026-10-31 probe measured [channeling:Eye Beam] true on every press during 6 channels and false
+-- on all 1302 outside.
+-- Re-equip (Reequip.lua): while a Fishing Pole is in the main hand, a press puts the remembered weapons back
+-- instead of stepping; reequipCond/reequipText are set out of combat by Reequip.lua, nil when nothing is armed.
+rotBtn:WrapScript(rotBtn, "OnClick", [=[
+    if down then return end
+    if reequipCond and reequipText and SecureCmdOptionParse(reequipCond) then
+        self:SetAttribute('macrotext', reequipText)
+        return
+    end
+    local inWindow = false
+    if links and #links > 0 then
+        local channeling, open = false, false
+        for i = 1, #links do
+            if SecureCmdOptionParse(links[i][1]) then
+                armed[i] = armPresses
+                channeling = true
+            elseif (armed[i] or 0) > 0 then
+                open = true
+            end
+        end
+        if channeling then
+            nextLink = 0
+            followerTurn = true
+        elseif open or not followerTurn then
+            -- "not followerTurn": the press after the last try is still in the window.
+            inWindow = true
+            if followerTurn then
+                followerTurn = false
+                local n = #links
+                for k = 1, n do
+                    local i = (nextLink + k - 1) % n + 1
+                    if (armed[i] or 0) > 0 then
+                        armed[i] = armed[i] - 1
+                        nextLink = i
+                        self:SetAttribute('macrotext', links[i][2])
+                        return
+                    end
+                end
+            else
+                followerTurn = true
+            end
+        end
+    end
+    local step = tonumber(self:GetAttribute('step'))
+    if not macros or #macros == 0 then return end
+    if inWindow then
+        local guard = #macros
+        while skip[step] and guard > 1 do
+            step = step % #macros + 1
+            guard = guard - 1
+        end
+    end
+    -- Long buffs (PR.BUFF_FIGHT_TURNS): in combat, cap[step] names a long-buff spell, and once its turns this fight
+    -- reach capN its steps are passed over. capUsed is emptied out of combat after each fight (PLAYER_REGEN_DISABLED
+    -- queues it) and at every compile. Turns, not casts: this code cannot see whether the cast landed.
+    if capN > 0 and SecureCmdOptionParse('[combat] 1') then
+        local guard = #macros
+        while cap[step] and (capUsed[cap[step]] or 0) >= capN and guard > 0 do
+            step = step % #macros + 1
+            guard = guard - 1
+        end
+        if cap[step] then
+            if (capUsed[cap[step]] or 0) >= capN then
+                self:SetAttribute('macrotext', '')   -- every step is a spent long buff
+                return
+            end
+            capUsed[cap[step]] = (capUsed[cap[step]] or 0) + 1
+        end
+    end
+    self:SetAttribute('macrotext', macros[step] or '')
+    step = step % #macros + 1
+    self:SetAttribute('step', step)
+]=])
+
+PR.rotBtn = rotBtn
+
+----------------------------------------------------------------
+--  Debounced compile — editor changes batch into a single compile
+----------------------------------------------------------------
+function PR:ScheduleCompile()
+    if self._compileTimer then self._compileTimer:Cancel() end
+    self._compileTimer = C_Timer.NewTimer(0.3, function()
+        self._compileTimer = nil
+        self:CompileSequence()
+    end)
+end
+
+----------------------------------------------------------------
+--  Skip a buff you already have (owner, 2026-11-12: a Warrior's shouts cost rage every time they recast).
+--
+--  The press snippet cannot read auras (no aura function in RestrictedEnvironment.lua, forever + live) and the
+--  compiled list cannot change in combat, so this is decided OUT OF COMBAT, at compile: a spell entry whose buff
+--  is on you -- an aura of the same NAME, so any rank counts, from anyone -- with more than BUFF_SKIP_LEFT seconds
+--  left (or no end) is left out of the rotation. With BUFF_SKIP_LEFT or less it is back in, so a fight that starts
+--  then can refresh it. Re-decided on the player's UNIT_AURA out of combat (only when the answer changes), by a
+--  timer at the BUFF_SKIP_LEFT mark, and once after combat if auras changed during it. A buff that falls off
+--  mid-fight comes back only after the fight. C_UnitAuras.GetAuraDataBySpellName (UnitAuraDocumentation.lua, both
+--  games); an unreadable or secret answer counts as "not on you", so the spell stays in.
+----------------------------------------------------------------
+PR.BUFF_SKIP_LEFT = 30
+-- In combat a long buff's step gets this many TURNS per fight (owner chose this experiment, 2026-11-12: the shout
+-- recast at every turn with rage in a fight that started without it). Tuned from his in-game results. A long buff =
+-- one seen on you out of combat lasting PR.BUFF_LONG seconds or more, or with no end (e.long, saved on the entry), so
+-- short self-buff cooldowns (Avatar-like, seconds long) are never capped.
+PR.BUFF_FIGHT_TURNS = 3
+PR.BUFF_LONG = 60
+-- Seals (owner, 2026-11-17, Forever Paladin: Seal of Righteousness lasts 30 s): a buff shorter than BUFF_LONG counts
+-- as long too when its spell is ready to cast again while the buff is on you -- a buff kept up by recasting, not a
+-- cooldown. Avatar-like buffs are on cooldown while they last, so they are still never capped. Up to the global
+-- cooldown counts as ready. C_Spell.GetSpellCooldown, SpellDocumentation.lua forever (duration 0 when inactive,
+-- SpellSharedDocumentation.lua); unreadable or secret = not ready, the old rule.
+PR.BUFF_RECAST_GCD = 1.5
+-- A short buff comes back in at a third of its length (Seal: 10 s left), not at BUFF_SKIP_LEFT, which it never has.
+PR.BUFF_SKIP_PART = 3
+
+local function ReadyWhileUp(spellName)
+    local api = C_Spell and C_Spell.GetSpellCooldown
+    if not api then return false end
+    local ok, cd = pcall(api, spellName)
+    if not ok or type(cd) ~= "table" then return false end
+    local d = cd.duration
+    if type(d) ~= "number" or (issecretvalue and issecretvalue(d)) then return false end
+    return d <= PR.BUFF_RECAST_GCD
+end
+
+-- Blizzard's Attack spell: 6603 in both games (wago.tools SpellName: wowf "Attack", wow "Auto Attack"). By ID, or by
+-- its name for an entry saved without one.
+PR.ATTACK_SPELL_ID = 6603
+function PR.IsAttackSpell(e)
+    if not e or e.macroName or e.itemID then return false end
+    if e.spellID == PR.ATTACK_SPELL_ID then return true end
+    if e.spellID or not e.spellName then return false end
+    local name = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(PR.ATTACK_SPELL_ID)
+    return name ~= nil and name == e.spellName
+end
+
+-- up, ends (nil = no end), long, and the seconds-left mark at which it comes back into the rotation.
+function PR:BuffUp(spellName)
+    local api = C_UnitAuras and C_UnitAuras.GetAuraDataBySpellName
+    if not api or type(spellName) ~= "string" or InCombatLockdown() then return false end
+    local ok, aura = pcall(api, "player", spellName, "HELPFUL")
+    if not ok or type(aura) ~= "table" then return false end
+    local exp, dur = aura.expirationTime, aura.duration
+    if issecretvalue and (issecretvalue(exp) or issecretvalue(dur)) then return false end
+    local long = type(dur) == "number" and (dur == 0 or dur >= self.BUFF_LONG)
+    if not long and type(dur) == "number" and dur > 0 then long = ReadyWhileUp(spellName) end
+    if type(exp) ~= "number" or exp == 0 then return true, nil, long end
+    local mark = self.BUFF_SKIP_LEFT
+    if type(dur) == "number" and dur > 0 and dur / self.BUFF_SKIP_PART < mark then mark = dur / self.BUFF_SKIP_PART end
+    return exp - GetTime() > mark, exp, long, mark
+end
+
+-- The spell entries skipped right now and when their buffs end, as one string, to tell whether a recompile would
+-- change anything (the end time is in it so a refreshed buff moves the wake-up timer too).
+function PR:BuffSkipSignature()
+    local profile = self.db and self:CurrentProfile()
+    local up = {}
+    for _, e in ipairs(profile and profile.spells or {}) do
+        if e and e.spellName and not e.macroName and not e.itemID then
+            local isUp, ends, long = self:BuffUp(e.spellName)
+            if long and not e.long then e.long = true; up[#up + 1] = "new long buff" end
+            if isUp then up[#up + 1] = e.spellName .. ":" .. tostring(ends or 0) end
+        end
+    end
+    return tconcat(up, "\n")
+end
+
+function PR:OnPlayerAura()
+    if not self._lastProfileKey then return end   -- before PLAYER_LOGIN's first compile
+    if InCombatLockdown() then
+        if not self._auraQueued then
+            self._auraQueued = true
+            VUI.CombatQueue.Add(function() PR._auraQueued = false; PR:OnPlayerAura() end)
+        end
+        return
+    end
+    if self:BuffSkipSignature() ~= (self._buffSig or "") then self:ScheduleCompile() end
+end
+
+----------------------------------------------------------------
+--  Entry identity — stable key for an entry across sessions/reorders.
+--  Used by the "After" (follows) feature: e.follows stores the TARGET
+--  entry's key, so the link survives list reordering and re-adding the
+--  same spell. Nil for entries that can't be identified.
+----------------------------------------------------------------
+function PR.EntryKey(e)
+    if not e then return nil end
+    if e.macroName then return "macro:" .. e.macroName end
+    if e.itemID    then return "item:"  .. tostring(e.itemID) end
+    if e.spellID   then return "spell:" .. tostring(e.spellID) end
+    if e.spellName then return "spellname:" .. e.spellName end
+    return nil
+end
+
+----------------------------------------------------------------
+--  Smooth-Weave Compiler (v1.9.6 — replaces the clumping interleave)
+--
+--  WHY (design session 2026-07-11): PR is a BLIND stepper — the secure
+--  snippet cannot see cooldowns, so the only lever for "cast X reliably
+--  when it comes off cooldown" is HOW OFTEN the sequence attempts X.
+--  Attempt economics are lopsided: a not-ready attempt costs one press
+--  (~100ms at spam/hardware-repeat rates; the GCD throttles real
+--  throughput, not presses), while a ready ability waiting for its next
+--  step costs seconds of uptime. So high priority = attempted often,
+--  and attempts must be SPREAD EVENLY. The old interleave appended
+--  copies in blocks (freq 4 → four consecutive steps of the same
+--  spell), guaranteeing dead-press runs and long gaps — the root of
+--  "misses the window" complaints.
+--
+--  Placement: smooth weighted round-robin (the nginx algorithm) —
+--  each slot, every entry gains its weight; the highest current wins
+--  the slot and pays back the total. Deterministic, respects profile
+--  order on ties, and yields per-entry gaps as even as arithmetic
+--  allows (weight 4 of total 10 → attempted every 2-3 steps).
+--
+--  "After" column (v1.36.0): NOT placed here. Until v1.36.0 a follower was
+--  also emitted right after every occurrence of its target, which could
+--  not hold anything back — the target step comes round whether or not
+--  the target is ready, and the follower kept its own slots (owner: Essence
+--  Break never waited for Eye Beam). Links now go to the press snippet
+--  (rotBtn WrapScript above), which can SEE a channel; so only a spell
+--  entry that has been seen channelling (e.channel, learned from
+--  UNIT_SPELLCAST_CHANNEL_START) can be a target. "Only after"
+--  (e.followOnly) drops the follower from the placement below, so it is
+--  cast after the channel and never on its own. Adjacent duplicate steps
+--  are collapsed (identical macrotext back-to-back adds nothing).
+--
+--  Constraints this design honors (memory: pr-rotation-constraints):
+--  castsequence and multi-line /cast fallback are both falsified by
+--  in-game testing — everything here is plain single-/cast steps,
+--  the same runtime mechanics PR has always used.
+----------------------------------------------------------------
+function PR:CompileSequence()
+    if not self.db then return end
+    if InCombatLockdown() then
+        -- Dedup: only one compile queued at a time; flag clears when it fires.
+        if not self._compileQueued then
+            self._compileQueued = true
+            VUI.CombatQueue.Add(function()
+                PR._compileQueued = false
+                PR:CompileSequence()
+            end)
+        end
+        return
+    end
+
+    self:MarkChannelEntries()   -- a spell dropped or a spec switched to since the channel was seen
+    local seq, names, links = {}, {}, {}
+    local skippedBuffs, buffSig, wakeAt = {}, {}, nil   -- spell entries left out because their buff is on you
+    local capText = {}   -- macrotext -> long-buff spell name (capped per fight)
+    local profile = self:CurrentProfile()
+    -- Reacquire prefix — prepended to spell steps only when the profile
+    -- opts in. `/cleartarget [dead]` drops a corpse; `/targetenemy
+    -- [noexists]` then grabs the nearest enemy only when you have no
+    -- target. A live, manually-chosen target satisfies neither condition,
+    -- so it is never overridden — the sole triggers are target death and
+    -- your own tab/click. Macro and item steps are left untouched (macros
+    -- may carry their own @mouseover/@focus targeting; trinkets need no
+    -- target). These are ordinary secure macro commands run through the
+    -- existing macrotext path — no new taint surface.
+    local reacqPrefix = (profile and profile.reacquire)
+        and "/cleartarget [dead]\n/targetenemy [noexists]\n" or ""
+    if profile and profile.spells and #profile.spells > 0 then
+        local entries = {}   -- resolved steps: { text, name, key, weight, follows, only, chanName }
+        for _, e in ipairs(profile.spells) do
+            if e then
+                local macrotext, entryName
+                if e.macroName then
+                    local mName, mIcon, mBody = GetMacroInfo(e.macroName)
+                    if mBody and mBody ~= "" then
+                        macrotext = mBody
+                        entryName = "[MACRO:" .. (mName or e.macroName) .. "]"
+                        if mIcon then e.icon = mIcon end   -- keep editor icon current
+                        -- Macro is back; reset warning state so a future
+                        -- delete-and-recompile warns again.
+                        PR._missingMacroWarned[e.macroName] = nil
+                    elseif not PR._missingMacroWarned[e.macroName] then
+                        -- Macro has been deleted or renamed since the entry
+                        -- was authored.  Without this warning the entry is
+                        -- silently elided from the rotation and the user
+                        -- has no signal that anything is wrong.
+                        PR._missingMacroWarned[e.macroName] = true
+                        VUI.Print("Priority Rotation", format(
+                            VUI.COL.ORANGE .. "Missing macro|r " .. VUI.COL.YELLOW
+                                .. "%s|r — entry skipped this session. Recreate the macro in " .. VUI.COL.YELLOW .. "/macro|r.",
+                            e.macroName))
+                    end
+                elseif e.itemID then
+                    local useTarget = e.itemName
+                    if not useTarget or useTarget == "" then
+                        useTarget = "item:" .. tostring(e.itemID)
+                    end
+                    macrotext = "/use " .. (e.combatOnly and "[combat, nochanneling] "
+                        or "[nochanneling] ") .. useTarget
+                    entryName = "[ITEM:" .. (e.itemName or tostring(e.itemID)) .. "]"
+                elseif e.spellName then
+                    -- Validate spellID resolves; stale IDs would otherwise
+                    -- emit /cast lines that surface as "Unknown spell"
+                    -- chat noise at every key press, with no diagnostic.
+                    -- Skip and warn once per session per stale ID.  A
+                    -- missing spellID (older profile entry) is allowed
+                    -- through unchanged — only stored IDs are validated.
+                    local stale = false
+                    if e.spellID then
+                        local info = C_Spell.GetSpellInfo(e.spellID)
+                        if info == nil then stale = true end
+                    end
+                    local attack = PR.IsAttackSpell(e)
+                    local buffUp, buffEnds, buffLong, buffMark = false, nil, false, nil
+                    if not stale and not attack then buffUp, buffEnds, buffLong, buffMark = self:BuffUp(e.spellName) end
+                    if buffLong then e.long = true end
+                    local wake = buffUp and buffEnds and buffEnds - (buffMark or self.BUFF_SKIP_LEFT)
+                    if wake and (not wakeAt or wake < wakeAt) then wakeAt = wake end
+                    if buffUp then
+                        skippedBuffs[#skippedBuffs + 1] = e.spellName   -- on you already (BuffUp above)
+                        buffSig[#buffSig + 1] = e.spellName .. ":" .. tostring(buffEnds or 0)
+                    elseif not stale then
+                        -- CHANNEL PROTECTION (2026-07-11, verified in-game): a press
+                        -- landing mid-channel CLIPS the channel tail at GCD-end —
+                        -- one unprotected Throw Glaive macro cost every Eye Beam its
+                        -- full-channel bonus and ~4-6k DPS before it was found. The
+                        -- user's hand-built macros have always carried
+                        -- [nochanneling]; spell entries compiled here must get the
+                        -- same protection or raw-spell profiles clip. A press during
+                        -- a channel becomes a no-op; the channel completes; the next
+                        -- press casts normally. Macro entries are NOT touched —
+                        -- their bodies (and conditionals) belong to the user.
+                        --
+                        -- COMBAT GATE (v1.9.7): per-entry opt-in [combat] — the
+                        -- Editor's "Combat" checkbox. Replicates the user's
+                        -- hand-macro convention [combat, nochanneling] so profiles
+                        -- no longer need hand-built macros at all; the entry left
+                        -- unchecked is the designated opener (castable out of
+                        -- combat to start the fight).
+                        local cond = e.combatOnly and "[combat, nochanneling] " or "[nochanneling] "
+                        if attack then
+                            -- Attack is a toggle: /cast Attack on every turn switched it off again
+                            -- (owner, Forever Paladin, 2026-11-17). /startattack only turns it on
+                            -- (SlashCommands.lua STARTATTACK, Shared, forever + live).
+                            macrotext = reacqPrefix .. "/startattack " .. (cond:gsub("%] $", ", harm, nodead]"))
+                        else
+                            macrotext = reacqPrefix .. "/cast " .. cond .. e.spellName
+                        end
+                        entryName = e.spellName
+                        if e.spellID then
+                            PR._missingSpellWarned[e.spellID] = nil
+                        end
+                    elseif not PR._missingSpellWarned[e.spellID] then
+                        PR._missingSpellWarned[e.spellID] = true
+                        VUI.Print("Priority Rotation", format(
+                            VUI.COL.ORANGE .. "Stale spell|r " .. VUI.COL.YELLOW
+                                .. "%s|r (ID %d) — entry skipped this session. Drag the current version of the spell back onto the slot.",
+                            e.spellName, e.spellID))
+                    end
+                end
+
+                if macrotext then
+                    local weight = e.freq or 1
+                    if weight < 1 then weight = 1 elseif weight > 5 then weight = 5 end
+                    -- A channel can be an "After" target only by a name the
+                    -- [channeling:] conditional can carry: ] ; , would end it.
+                    local chanName = e.channel and not e.macroName and not e.itemID
+                        and e.spellName and not e.spellName:find("[%];,]") and e.spellName or nil
+                    entries[#entries + 1] = {
+                        text     = macrotext,
+                        name     = entryName,
+                        key      = PR.EntryKey(e),
+                        weight   = weight,
+                        follows  = e.follows,
+                        only     = e.followOnly and true or false,
+                        chanName = chanName,
+                        capName  = e.long and e.spellName and not e.macroName and not e.itemID and e.spellName or nil,
+                        current  = 0,   -- smooth-WRR accumulator
+                    }
+                end
+            end
+        end
+
+        -- "After" links (see the press snippet on rotBtn). A link is live only when its target
+        -- is in the list and has been seen channelling; otherwise it is inert and the follower
+        -- is placed normally, so a not-yet-learned target can never silence an ability.
+        local byKey = {}
+        for _, it in ipairs(entries) do
+            if it.key and not byKey[it.key] then byKey[it.key] = it end
+            if it.capName then capText[it.text] = it.capName end
+        end
+        -- Only After links first: this window is a held ability's only chance, while an Also
+        -- After one still has its normal slots.
+        local linked = {}
+        for _, it in ipairs(entries) do if it.only then linked[#linked + 1] = it end end
+        for _, it in ipairs(entries) do if not it.only then linked[#linked + 1] = it end end
+        for _, it in ipairs(linked) do
+            local target = it.follows and byKey[it.follows]
+            if target and target ~= it and target.chanName then
+                links[#links + 1] = {
+                    cond   = "[channeling:" .. target.chanName .. "] 1",
+                    text   = it.text,
+                    name   = it.name,
+                    target = target.name,
+                    targetText = target.text,
+                    only   = it.only,
+                }
+                it.held = it.only
+            end
+        end
+
+        -- Smooth weighted round-robin: cycle length = sum of weights;
+        -- ipairs order makes tie-breaking stable in profile order.
+        local placed = {}
+        for _, it in ipairs(entries) do
+            if not it.held then placed[#placed + 1] = it end
+        end
+        local total = 0
+        for _, it in ipairs(placed) do total = total + it.weight end
+        for _ = 1, total do
+            local best
+            for _, it in ipairs(placed) do
+                it.current = it.current + it.weight
+                if not best or it.current > best.current then best = it end
+            end
+            best.current = best.current - total
+            -- Identical back-to-back steps are collapsed: a duplicate adds nothing at runtime.
+            if seq[#seq] ~= best.text then
+                seq[#seq + 1] = best.text
+                names[#seq]   = best.name
+            end
+        end
+
+        -- Cycle wrap-around collapse. The sequence is CYCLIC — the secure
+        -- snippet advances with `step % #macros + 1` — so the last step and
+        -- the first are adjacent at runtime as well, and that is the one
+        -- adjacent pair the peephole above never compares. Left unhandled,
+        -- {A freq 3, B freq 1} compiles to [A, B, A] and plays
+        -- A,B,A,A,B,A… — a dead duplicate press every cycle, which is exactly
+        -- the clumping the v1.9.6 redesign exists to remove. It happens
+        -- whenever the top-weight entry also wins the final slot, i.e. the
+        -- normal case. Exactly one drop can ever be needed: no two
+        -- consecutive steps match, so the new last step cannot equal seq[1].
+        if #seq > 1 and seq[#seq] == seq[1] then
+            names[#seq] = nil
+            seq[#seq]   = nil
+        end
+    end
+
+    self.compiledSequence = seq
+    self.compiledNames    = names
+    self.compiledLinks    = links
+    self.skippedBuffs     = skippedBuffs
+    self._buffSig         = tconcat(buffSig, "\n")
+    -- Back in at the mark (BuffUp) of the first skipped buff that comes back.
+    if self._buffTimer then self._buffTimer:Cancel(); self._buffTimer = nil end
+    if wakeAt then
+        local delay = wakeAt - GetTime()
+        self._buffTimer = C_Timer.NewTimer(delay > 0 and delay + 0.1 or 0.1, function()
+            PR._buffTimer = nil
+            PR:OnPlayerAura()
+        end)
+    end
+    -- Steps the window skips (see the press snippet): a target's own step is on cooldown right
+    -- after its channel, and a follower's own step is already being tried by the window.
+    local skipText = {}
+    for _, l in ipairs(links) do skipText[l.text] = true; skipText[l.targetText] = true end
+    local skip = {}
+    for i, t in ipairs(seq) do if skipText[t] then skip[#skip + 1] = i end end
+    -- Long-buff steps capped per fight (see the press snippet): step index -> spell name.
+    local cap = {}
+    for i, t in ipairs(seq) do if capText[t] then cap[i] = capText[t] end end
+    self.compiledCaps = cap
+    self:InjectSequence(seq, links, skip, cap)
+    self:ScheduleScan(0.5)
+    -- The editor redraws the instant a change is made, but the compile it triggers is debounced
+    -- (ScheduleCompile, 0.3 s), so without this the preview showed the PREVIOUS sequence until
+    -- something else redrew it (audit P4).
+    self:RefreshUI()
+    DebugPrint("Compiled " .. #seq .. " step(s), " .. #links .. " After link(s)")
+end
+
+-- Returns a Lua long-string literal that safely embeds any string content,
+-- including those containing ]] or ]=] sequences. Scans for the minimum
+-- nesting level whose closing delimiter does not appear in the string.
+-- A string ending in "]" is checked with one more "]" after it: "[[x]]]" closes one "]" early (an error the
+-- first time a step ended in a conditional, "/startattack [harm, nodead]", 2026-11-17).
+local function SafeQuote(s)
+    local level = 0
+    while (s .. "]"):find("]" .. string.rep("=", level) .. "]", 1, true) do
+        level = level + 1
+    end
+    local eq = string.rep("=", level)
+    return "[" .. eq .. "[" .. s .. "]" .. eq .. "]"
+end
+
+function PR:InjectSequence(seq, links, skip, cap)
+    if InCombatLockdown() then return end
+    local lines = { "macros = newtable()", "links = newtable()", "armed = newtable()", "nextLink = 0",
+                    "followerTurn = true", "skip = newtable()", "cap = newtable()", "capUsed = newtable()",
+                    "capN = " .. tostring(tonumber(self.BUFF_FIGHT_TURNS) or 0) }
+    if #seq > 0 then
+        for i, macro in ipairs(seq) do
+            lines[#lines + 1] = "macros[" .. i .. "] = " .. SafeQuote(macro)
+        end
+    else
+        lines[#lines + 1] = "macros[1] = ''"
+    end
+    for i, l in ipairs(links or {}) do
+        lines[#lines + 1] = "links[" .. i .. "] = newtable(" .. SafeQuote(l.cond) .. ", "
+            .. SafeQuote(l.text) .. ")"
+    end
+    for _, i in ipairs(skip or {}) do lines[#lines + 1] = "skip[" .. i .. "] = true" end
+    for i, name in pairs(cap or {}) do lines[#lines + 1] = "cap[" .. i .. "] = " .. SafeQuote(name) end
+    rotBtn:Execute(tconcat(lines, "\n"))
+    rotBtn:SetAttribute("macrotext", seq[1] or "")
+    rotBtn:SetAttribute("step", 1)
+end
+
+----------------------------------------------------------------
+--  Macro Stub
+--
+--  Returns true on success, false on failure. Silent combat-lockdown
+--  no-op returns false; callers that surface a success message should
+--  gate it on the return value.
+--
+--  ⚠ OWNERSHIP (audit P1, v1.17.10): "Attack" is an ordinary macro name, so a macro by that
+--  name is only OURS if its body clicks our button. This used to run at every login for every
+--  player, created the macro whether or not the rotation was set up, and overwrote any macro of
+--  the player's own that happened to be called Attack -- then bound the rotation to its key.
+--  Now: `create` is true only for an explicit request (/pr macro, the Create / Update button);
+--  the login refresh only ever edits a macro that is already ours, and a foreign one is never
+--  written to or bound.
+----------------------------------------------------------------
+-- 1 = ours, 0 = no macro by that name, -1 = a different macro holds the name. Second return is
+-- the macro index when one exists.
+function PR:StubState()
+    local idx = GetMacroIndexByName(self.MACRO_NAME)
+    if not idx or idx == 0 then return 0 end
+    local _, _, body = GetMacroInfo(idx)
+    if type(body) == "string" and body:find("/click " .. self.BUTTON_NAME, 1, true) then
+        return 1, idx
+    end
+    return -1, idx
+end
+
+local FOREIGN_ATTACK_MSG = VUI.COL.ORANGE .. "A macro named " .. VUI.COL.YELLOW
+    .. "Attack|r already exists and isn't the "
+    .. "rotation's.|r It has been left alone. Rename it in " .. VUI.COL.YELLOW .. "/macro|r, then click "
+    .. VUI.COL.YELLOW .. "Create / Update Macro|r."
+
+function PR:UpdateMacroStub(create)
+    if InCombatLockdown() then return false end
+
+    local state, idx = self:StubState()
+    if state == -1 then
+        if create or not self._foreignWarned then
+            self._foreignWarned = true
+            VUI.Print("Priority Rotation", FOREIGN_ATTACK_MSG)
+        end
+        return false
+    end
+    if state == 0 and not create then return false end
+
+    local macroBody = "#showtooltip\n/click " .. self.BUTTON_NAME
+    local macroIcon = "ability_warrior_charge"
+    local profile   = self:CurrentProfile()
+    if profile and profile.spells and profile.spells[1] and profile.spells[1].icon then
+        macroIcon = profile.spells[1].icon
+    end
+
+    if state == 1 then
+        -- pcall-wrap the EditMacro write — historically reliable but the
+        -- macro frame can be in a transient state during /reload bursts
+        -- or addon-driven CreateMacro pile-ups; a hard error here would
+        -- leave the user with a vague Lua popup instead of a clean
+        -- 'try again in a moment' message.  Matches the failure-return
+        -- contract used by the macro-list-full branch below.
+        local ok, err = pcall(EditMacro, idx, self.MACRO_NAME, macroIcon, macroBody)
+        if not ok then
+            VUI.Print("Priority Rotation",
+                VUI.COL.RED .. "Couldn't update the Attack macro|r — "
+                .. tostring(err))
+            return false
+        end
+        return true
+    else
+        if GetNumMacros() < (MAX_ACCOUNT_MACROS or 120) then
+            -- pcall-wrap CreateMacro for the same reason v1.6.39 wrapped
+            -- EditMacro in the sibling branch above — the macro frame can
+            -- be in a transient state during /reload bursts.  Mirrors the
+            -- failure-return contract from EditMacro and the macro-
+            -- list-full branch below.
+            local ok, err = pcall(CreateMacro, self.MACRO_NAME, macroIcon, macroBody)
+            if not ok then
+                VUI.Print("Priority Rotation",
+                    VUI.COL.RED .. "Couldn't create the Attack macro|r — "
+                    .. tostring(err))
+                return false
+            end
+            return true
+        else
+            VUI.Print("Priority Rotation",
+                VUI.COL.RED .. "Can't create the Attack macro — your account macro list is full "
+                .. "(120/120).|r Delete an unused macro in " .. VUI.COL.YELLOW .. "/macro|r, then try again.")
+            return false
+        end
+    end
+end
+
+----------------------------------------------------------------
+--  Action Bar Keybind Override
+--
+--  Redirects the bar button containing a macro so that pressing its
+--  keybind clicks rotBtn instead. Works with any bar — visible,
+--  hidden, or tucked away.
+--
+--  Slot mapping (audit P3, v1.17.10 — sourced, Blizzard_ActionBar/Shared/MultiActionBars.lua:1-8
+--  and MultiActionBars.xml actionpage attributes): Action Bar 1 = slots 1-12; Bars 2-5 =
+--  pages 6/5/3/4 = slots 61-72, 49-60, 25-36, 37-48; Bars 6-8 = pages 13/14/15 = slots
+--  145-180. UNMAPPED on purpose: 13-24 (main bar page 2) and 73-144 (the bonus pages WoW swaps
+--  in for druid forms, stealth, etc.) -- a key bound there belongs to the main bar, so no
+--  binding of ours can stand in for it. Until v1.17.10 slots 73-120 were mapped to Bars 6-8
+--  (wrong: that bound the rotation to an unrelated Bar 6-8 key) and 121-180 were never scanned.
+--
+--  Direct mouse clicks still work via the macro's /click PRAttackButton.
+--
+--  ScanAndOverrideBarButton accepts an optional macroName so the same
+--  scan machinery can support additional macros in the future (e.g. an
+--  interrupt rotation) without structural changes. ClearOverride clears
+--  all override bindings for SECURE_HANDLER — with a single macro this
+--  is correct; future multi-macro support would re-apply remaining
+--  overrides here after removing the requested one.
+----------------------------------------------------------------
+local SECURE_HANDLER = CreateFrame("Frame", "PRSecureHandler", nil, "SecureHandlerBaseTemplate")
+
+local SLOT_TO_BIND = {}
+local BIND_DEFS = {
+    { base =   0, bind = "ACTIONBUTTON" },
+    { base =  24, bind = "MULTIACTIONBAR3BUTTON" },
+    { base =  36, bind = "MULTIACTIONBAR4BUTTON" },
+    { base =  48, bind = "MULTIACTIONBAR2BUTTON" },
+    { base =  60, bind = "MULTIACTIONBAR1BUTTON" },
+    { base = 144, bind = "MULTIACTIONBAR5BUTTON" },
+    { base = 156, bind = "MULTIACTIONBAR6BUTTON" },
+    { base = 168, bind = "MULTIACTIONBAR7BUTTON" },
 }
+for _, def in ipairs(BIND_DEFS) do
+    for i = 1, 12 do
+        SLOT_TO_BIND[def.base + i] = def.bind .. i
+    end
+end
 
-DUI:RegisterModule(ns.MODULE, {
-    plugin = ADDON,
-    label = "Priority Rotation",
-    defaults = ns.defaults,
-    options = { pages = ns.pages },
-})
+function PR:ClearOverride(macroName)
+    if InCombatLockdown() then
+        VUI.CombatQueue.Add(function() PR:ClearOverride(macroName) end)
+        return
+    end
+    ClearOverrideBindings(SECURE_HANDLER)
+    if macroName then
+        self.overrides[macroName] = nil
+    else
+        self.overrides = {}
+    end
+    DebugPrint("ClearOverride" .. (macroName and " (" .. macroName .. ")" or " (all)"))
+end
+
+function PR:ScanAndOverrideBarButton(macroName, verbose)
+    macroName = macroName or self.MACRO_NAME
+    if InCombatLockdown() or not self:IsEnabled() then return end
+
+    -- Only a macro that is ours (see StubState). A different macro called Attack is the player's;
+    -- taking over its key would hijack whatever it does.
+    local state, macroIdx = self:StubState()
+    if state ~= 1 then
+        if state == -1 then
+            -- Drop any binding left from when the name was still ours (body edited mid-session).
+            self:ClearOverride(macroName)
+            if verbose then VUI.Print("Priority Rotation", FOREIGN_ATTACK_MSG) end
+        end
+        return
+    end
+
+    -- Midnight Secret Values: GetActionInfo can return secret values in
+    -- raid/M+ zones; pcall each slot and count failures. Verbose callers
+    -- (user-initiated /pr scan and "Scan & Bind" button) surface the
+    -- diagnostic so the user knows what to do.
+    -- A bindable copy wins over an unbindable one found earlier (e.g. Attack on a form page AND
+    -- on Bar 6), so the scan does not stop at the first match.
+    local foundSlot
+    local unreadableSlots = 0
+    for slot = 1, PR.MAX_ACTION_SLOT do
+        local ok, actionType, id = pcall(GetActionInfo, slot)
+        if ok then
+            if actionType == "macro" and id == macroIdx then
+                if SLOT_TO_BIND[slot] then foundSlot = slot; break end
+                foundSlot = foundSlot or slot
+            end
+        else
+            unreadableSlots = unreadableSlots + 1
+        end
+    end
+
+    if not foundSlot then
+        -- Off every bar now: the key it had is the player's again.
+        if self.overrides[macroName] then self:ClearOverride(macroName) end
+        if verbose and unreadableSlots > 0 then
+            VUI.Print("Priority Rotation",
+                format(VUI.COL.ORANGE .. "Scan incomplete:|r %d slot(s) unreadable "
+                    .. "(likely Midnight Secret Values in raid / M+). "
+                    .. "Re-run " .. VUI.COL.YELLOW .. "/pr scan|r after leaving the encounter, "
+                    .. "or move the Attack macro to a different bar.",
+                    unreadableSlots))
+        end
+        DebugPrint("Scan: " .. macroName .. " not found (" .. unreadableSlots .. " unreadable slots)")
+        return
+    end
+
+    -- Keybinding override — the sole click-routing mechanism.
+    local bindingCmd = SLOT_TO_BIND[foundSlot]
+    local boundKeys  = {}
+    if bindingCmd then
+        local k1, k2 = GetBindingKey(bindingCmd)
+        if k1 then boundKeys[#boundKeys + 1] = k1 end
+        if k2 then boundKeys[#boundKeys + 1] = k2 end
+    end
+
+    -- Unchanged since the last scan: leave the binding as it is. Setting it again would fire UPDATE_BINDINGS,
+    -- which itself starts a scan (event handler below), so a same-answer scan must be a no-op.
+    local cur = self.overrides[macroName]
+    if cur and cur.slot == foundSlot and tconcat(cur.keys or {}, "\n") == tconcat(boundKeys, "\n") then
+        return
+    end
+    self:ClearOverride(macroName)
+
+    self.overrides[macroName] = {
+        slot = foundSlot,
+        keys = #boundKeys > 0 and boundKeys or nil,
+    }
+
+    if #boundKeys > 0 then
+        for _, key in ipairs(boundKeys) do
+            SetOverrideBindingClick(SECURE_HANDLER, false, key, PR.BUTTON_NAME)
+        end
+        DebugPrint("Scan: " .. macroName .. " bound to " .. tconcat(boundKeys, ", "))
+    else
+        DebugPrint("Scan: " .. macroName .. " found on slot " .. foundSlot .. " — no keybind")
+    end
+end
+
+----------------------------------------------------------------
+--  UI Refresh — called by Settings.lua and event handlers
+----------------------------------------------------------------
+function PR:RefreshUI()
+    if self.Editor then self.Editor:Refresh() end
+    if self.MainWindow and self.MainWindow.RefreshBadge then
+        self.MainWindow:RefreshBadge()
+    end
+end
+
+----------------------------------------------------------------
+--  Channel learning — marks rotation spells seen channelling (e.channel)
+----------------------------------------------------------------
+PR._channelSeen = {}   -- [spellID] / [spellName] = true, this session
+
+-- The spell tooltip's cast-time row reads "Channeled" for a channel and "Instant" for an instant
+-- (measured 2026-10-31 with C_TooltipInfo.GetSpellByID on six Havoc spells: Eye Beam line 3 left =
+-- "Channeled"; the other five "Instant"). The word is Blizzard's SPELL_CAST_CHANNELED ("Channeled",
+-- GlobalStrings row 14797), so other languages are matched by their own word (audit P1, 2026-11-01;
+-- that the tooltip row uses that global is inferred, not measured on a non-English client). The
+-- cast-event learning below still marks the spell after its first cast either way. Cached per
+-- spell ID; an empty or secret answer is not cached, so it is asked again later.
+PR._tipChannel = {}
+local function TooltipSaysChannel(spellID)
+    local known = PR._tipChannel[spellID]
+    if known ~= nil then return known end
+    local ok, d = pcall(C_TooltipInfo.GetSpellByID, spellID)
+    if not ok or not d or not d.lines or #d.lines < 2 then return false end
+    local word = _G.SPELL_CAST_CHANNELED or "Channeled"
+    local found = false
+    for i = 2, math.min(#d.lines, 5) do
+        local t = d.lines[i].leftText
+        if t == nil or (issecretvalue and issecretvalue(t)) then return false end
+        if t == word or t == "Channeled" then found = true end
+    end
+    PR._tipChannel[spellID] = found
+    return found
+end
+
+local function SeenChannelling(e)
+    return e.spellID and (PR._channelSeen[e.spellID] or (e.spellName and PR._channelSeen[e.spellName])
+        or TooltipSaysChannel(e.spellID))
+end
+
+-- Run at every compile, so a spell dropped into the rotation is checked at once.
+function PR:MarkChannelEntries()
+    if not self.db then return false end
+    local changed = false
+    for _, e in ipairs(self:CurrentProfile().spells) do
+        if e and not e.channel and not e.macroName and not e.itemID and SeenChannelling(e) then
+            e.channel = true
+            changed = true
+        end
+    end
+    return changed
+end
+
+-- v1.36.0: an "After" target must be a channelled spell. Links to a macro or trinket can never
+-- be one, so they are cleared once (every profile), with one chat line saying so.
+function PR:ClearNonSpellAfterLinks()
+    if not self.db then return end
+    local n = 0
+    for _, profile in pairs(self.db.profiles or {}) do
+        for _, e in ipairs(profile.spells or {}) do
+            if e and e.follows and not e.follows:find("^spell") then
+                e.follows, e.followOnly = nil, nil
+                n = n + 1
+            end
+        end
+    end
+    if n > 0 then
+        VUI.Print("Priority Rotation", format(
+            VUI.COL.YELLOW .. "After|r now waits for a channelled spell, so %d link(s)"
+                .. " to a macro or trinket were cleared.",
+            n))
+    end
+end
+
+function PR:LearnChannel(spellID)
+    if spellID == nil or (issecretvalue and issecretvalue(spellID)) then return end
+    self._channelSeen[spellID] = true
+    local name = C_Spell.GetSpellName and C_Spell.GetSpellName(spellID)
+    if name and not (issecretvalue and issecretvalue(name)) then self._channelSeen[name] = true end
+    if self:MarkChannelEntries() then self:SaveCurrentProfile() end
+end
+
+----------------------------------------------------------------
+--  Event Handler
+----------------------------------------------------------------
+local ef = CreateFrame("Frame")
+ef:RegisterEvent("ADDON_LOADED")
+ef:RegisterEvent("PLAYER_LOGIN")
+ef:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+-- UPDATE_MACROS fires when any macro is created, edited, deleted, or
+-- reordered.  We re-run the compile so the missing-macro warning (v1.6.39)
+-- surfaces immediately on external deletion (the user has no other
+-- trigger; PR's own editor is debounced separately).  ScheduleCompile's
+-- 0.3s debounce coalesces editor bursts (rapid save/rename/reorder) into
+-- a single recompile, and CompileSequence's `if not self.db then return`
+-- guard makes any early fire (before ADDON_LOADED) a no-op.
+ef:RegisterEvent("UPDATE_MACROS")
+-- PLAYER_REGEN_ENABLED is owned by VUI.CombatQueue (Lib.lua).
+-- All deferred post-combat actions go through VUI.CombatQueue.Add().
+
+-- Learns which rotation spells are channels, the only valid "After" targets (no API says so;
+-- the event's spellID does, and is secret only where spell casts are restricted:
+-- UnitDocumentation.lua UnitSpellcastChannelStart, SecretWhenUnitSpellCastRestricted).
+ef:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_START", "player")
+ef:RegisterUnitEvent("UNIT_AURA", "player")   -- skip a buff you already have (PR:OnPlayerAura)
+-- A fight began: its long-buff turn counts (press snippet capUsed) are emptied when it ends, out of combat.
+ef:RegisterEvent("PLAYER_REGEN_DISABLED")
+-- The rotation's key is the key of the bar slot holding the Attack macro, read at a scan. A key rebound or the
+-- macro moved or taken off its bar changes that; Blizzard's own action buttons redraw on the same two events
+-- (Blizzard_ActionBar/Shared/ActionButton.lua:206-207 live, :216-217 forever). Without them the old key kept
+-- firing the rotation until the next compile or /reload (freshness review 2026-11-14).
+ef:RegisterEvent("UPDATE_BINDINGS")
+ef:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
+
+ef:SetScript("OnEvent", function(_, event, arg1, _, arg3)
+    if event == "UNIT_SPELLCAST_CHANNEL_START" then
+        PR:LearnChannel(arg3)
+
+    elseif event == "UPDATE_BINDINGS" or event == "ACTIONBAR_SLOT_CHANGED" then
+        -- Only once logged in and while the rotation is on. A scan already coming reads the new state when it
+        -- runs, so it is not moved (the login one waits 4 s on purpose).
+        if PR._lastProfileKey and PR:IsEnabled() and not PR._scanTimer then PR:ScheduleScan(0.5) end
+
+    elseif event == "PLAYER_REGEN_DISABLED" then
+        VUI.CombatQueue.Add(function() rotBtn:Execute("capUsed = newtable()") end)
+
+    elseif event == "UNIT_AURA" then
+        if arg1 == "player" then PR:OnPlayerAura() end
+
+    elseif event == "ADDON_LOADED" then
+        if arg1 ~= ADDON_NAME then return end
+        PR:InitDB()
+        ef:UnregisterEvent("ADDON_LOADED")
+
+    elseif event == "PLAYER_LOGIN" then
+        PR:ClearNonSpellAfterLinks()
+        PR:SwitchToCurrentSpec()
+        PR:CompileSequence()
+        PR._lastProfileKey = PR:GetProfileKey()
+        -- Icon refresh only, and only for the rotation's own macro (create = false).
+        C_Timer.After(2, function() if PR:IsEnabled() then PR:UpdateMacroStub(false) end end)
+        PR:ScheduleScan(4)
+    elseif event == "PLAYER_SPECIALIZATION_CHANGED" then
+        local newKey = PR:GetProfileKey()
+        if newKey == PR._lastProfileKey then return end
+        PR._lastProfileKey = newKey
+
+        PR:SwitchToCurrentSpec()
+        PR:CompileSequence()
+        VUI.Print("Priority Rotation",
+            format("Switched to " .. VUI.COL.YELLOW .. "%s|r.", PR:GetCurrentSpecLabel()))
+        PR:RefreshUI()
+        PR:ScheduleScan(1)
+
+    elseif event == "UPDATE_MACROS" then
+        -- Route through ScheduleCompile so editor bursts (rapid
+        -- save/rename/reorder) collapse into one recompile 0.3s after
+        -- the last fire.  CompileSequence then surfaces its missing-macro warning
+        -- for any rotation entry whose macro was deleted, and the now-
+        -- missing entry is elided so the rotation continues working
+        -- with whatever else is in the profile.
+        PR:ScheduleCompile()
+    end
+end)
+
+----------------------------------------------------------------
+--  Slash Commands
+----------------------------------------------------------------
+SLASH_PRDUI1 = "/pr"
+SLASH_PRDUI2 = "/priorityrotation"
+
+SlashCmdList["PRDUI"] = function(msg)
+    local cmd = strtrim(msg or ""):lower()
+
+    if cmd == "settings" then
+        VUI.Print("Priority Rotation", "Its settings are in the DaylightUI options: type " .. VUI.COL.YELLOW
+            .. "/dui|r, then Plugins, Rotation.")
+
+    elseif cmd == "clear" then
+        PR:CurrentProfile().spells = {}
+        PR:CompileSequence()
+        PR:RefreshUI()
+        VUI.Print("Priority Rotation", "Spell list cleared.")
+
+    elseif cmd == "reset" then
+        PR:ResetCurrentProfileToDefault()
+        PR:CompileSequence()
+        PR:RefreshUI()
+        VUI.Print("Priority Rotation", "Reset to spec defaults.")
+
+    elseif cmd == "scan" then
+        if InCombatLockdown() then
+            VUI.Print("Priority Rotation", VUI.COL.RED .. "Can't scan in combat.|r")
+            return
+        end
+        PR:ScanAndOverrideBarButton(PR.MACRO_NAME, true)
+        -- A foreign "Attack" was already explained by the scan; the not-found advice below
+        -- would contradict it.
+        if PR:StubState() == -1 then return end
+        local override = PR.overrides[PR.MACRO_NAME]
+        if override and override.keys then
+            VUI.Print("Priority Rotation",
+                "Keybind " .. VUI.COL.GREEN .. tconcat(override.keys, ", ")
+                .. "|r override active — spam the key to play.")
+        elseif override and not SLOT_TO_BIND[override.slot] then
+            -- Slots 13-24 (main bar page 2) and 73-144 (form/stealth bonus pages), which
+            -- SLOT_TO_BIND deliberately does not map. They arrive here in the same
+            -- keys == nil state as an unbound main-bar slot, but the advice below is
+            -- useless for them: no key assigned to such a slot produces a binding this
+            -- code can override, so the user could follow it forever. Druid form bars
+            -- and the rogue stealth bar are ordinary places to park a macro.
+            VUI.Print("Priority Rotation",
+                VUI.COL.ORANGE .. "Found on slot " .. override.slot
+                .. "|r — that bar page can't be bound. Move the macro to a main bar.")
+        elseif override then
+            VUI.Print("Priority Rotation",
+                VUI.COL.ORANGE .. "Found on slot " .. override.slot
+                .. "|r but no keybind — assign a key to that bar slot, then /pr scan.")
+        else
+            VUI.Print("Priority Rotation",
+                VUI.COL.ORANGE .. "Not found.|r Put " .. VUI.COL.YELLOW
+                .. PR.MACRO_NAME .. "|r macro on any action bar (visible or hidden) "
+                .. "with a keybind, then /pr scan")
+        end
+
+    elseif cmd == "macro" then
+        if InCombatLockdown() then
+            VUI.Print("Priority Rotation", VUI.COL.RED .. "Can't create macro in combat.|r")
+            return
+        end
+        if PR:UpdateMacroStub(true) then
+            VUI.Print("Priority Rotation",
+                "Macro " .. VUI.COL.YELLOW .. PR.MACRO_NAME
+                .. "|r is ready — drag it from /macro to an action bar.")
+        end
+        -- On failure, UpdateMacroStub already printed the specific reason.
+
+    elseif cmd == "status" then
+        local function yn(v) return v and VUI.COL.GREEN .. "yes|r" or VUI.COL.RED .. "no|r" end
+        local stubState  = PR:StubState()
+        local macroExists = stubState == 1
+        local override   = PR.overrides[PR.MACRO_NAME]
+        VUI.Print("Priority Rotation", "Status:")
+        VUI.Print("Priority Rotation", "  Enabled:  " .. yn(PR:IsEnabled()))
+        VUI.Print("Priority Rotation", "  Macro:    " .. yn(macroExists)
+            .. (macroExists and "" or (stubState == -1
+                and "  — another macro is named Attack; rename it"
+                or  "  — run " .. VUI.COL.YELLOW .. "/pr macro|r")))
+        VUI.Print("Priority Rotation", "  On bar:   " .. (override
+            and VUI.COL.GREEN .. "slot " .. override.slot .. "|r"
+            or  VUI.COL.RED .. "no|r  — run " .. VUI.COL.YELLOW .. "/pr scan|r"))
+        VUI.Print("Priority Rotation", "  Keybind:  " .. ((override and override.keys)
+            and VUI.COL.GREEN .. tconcat(override.keys, ", ") .. "|r"
+            or  VUI.COL.ORANGE .. "none|r — assign a key to the macro's bar slot"))
+        VUI.Print("Priority Rotation", "  Compiled: " .. #PR.compiledSequence .. " step(s)")
+
+    elseif cmd == "debug" then
+        PR.debug = not PR.debug
+        VUI.debug = PR.debug   -- also the combat-queue errors (Lib.lua)
+        VUI.Print("Priority Rotation",
+            "Debug " .. (PR.debug and VUI.COL.GREEN .. "ON|r" or VUI.COL.RED .. "OFF|r"))
+
+    elseif cmd == "test" then
+        VUI.Print("Priority Rotation", "Diagnostic:")
+        local p = PR:CurrentProfile()
+        if not p then VUI.Print("Priority Rotation", "  " .. VUI.COL.RED .. "No profile!|r"); return end
+        VUI.Print("Priority Rotation", "  Spec: " .. VUI.COL.YELLOW .. PR:GetCurrentSpecLabel() .. "|r")
+        VUI.Print("Priority Rotation", "  Compiled: " .. VUI.COL.YELLOW .. #PR.compiledSequence .. " steps|r")
+        for i, s in ipairs(PR.compiledSequence) do
+            local label = PR.compiledNames and PR.compiledNames[i] or s
+            VUI.Print("Priority Rotation", "    " .. i .. ". " .. label)
+            -- With debug on, show the step's ACTUAL macrotext so compiled
+            -- conditionals ([nochanneling], reacquire lines) are verifiable
+            -- in-game instead of inferred from behavior (2026-07-11: the
+            -- channel-protection rollout was untestable without this).
+            if PR.debug then
+                for line in s:gmatch("[^\n]+") do
+                    VUI.Print("Priority Rotation", "       " .. VUI.COL.GRAY .. line .. "|r")
+                end
+            end
+        end
+        local override = PR.overrides[PR.MACRO_NAME]
+        if override and override.keys then
+            VUI.Print("Priority Rotation", "  Keybind: " .. VUI.COL.GREEN .. tconcat(override.keys, ", ") .. "|r")
+        elseif override then
+            VUI.Print("Priority Rotation", "  Macro slot: " .. VUI.COL.ORANGE .. override.slot .. "|r (no keybind)")
+        else
+            VUI.Print("Priority Rotation", "  Override: " .. VUI.COL.ORANGE .. "not active|r")
+        end
+
+    elseif cmd == "diag" then
+        local patch = (GetBuildInfo and select(1, GetBuildInfo())) or "?"
+        VUI.Print("Priority Rotation", VUI.COL.YELLOW .. patch .. " API Diagnostic|r")
+        VUI.Print("Priority Rotation", "─────────────────────────────────────────")
+
+        local G = VUI.COL.GREEN
+        local R = VUI.COL.RED
+        local Y = VUI.COL.YELLOW
+        local E = "|r"
+
+        local hasIssecret = type(issecretvalue) == "function"
+        VUI.Print("Priority Rotation", "  issecretvalue():          " .. (hasIssecret and G.."available"..E or R.."NOT FOUND"..E))
+
+        -- luacheck: ignore 143 (table.freeze is a deliberate feature-probe)
+        local hasFreeze = type(table.freeze) == "function"
+        VUI.Print("Priority Rotation", "  table.freeze():           " .. (hasFreeze and G.."available"..E or Y.."not found"..E))
+
+        local hasRegBtn = C_ActionBar and type(C_ActionBar.RegisterActionUIButton) == "function"
+        VUI.Print("Priority Rotation", "  C_ActionBar.RegisterActionUIButton: " .. (hasRegBtn and G.."available"..E or R.."NOT FOUND"..E))
+
+        local hasUnregBtn = C_ActionBar and type(C_ActionBar.UnregisterActionUIButton) == "function"
+        VUI.Print("Priority Rotation", "  C_ActionBar.UnregisterActionUIButton: " .. (hasUnregBtn and G.."available"..E or R.."NOT FOUND"..E))
+
+        local hasSecrets = C_Secrets and type(C_Secrets) == "table"
+        VUI.Print("Priority Rotation", "  C_Secrets namespace:      " .. (hasSecrets and G.."available"..E or R.."NOT FOUND"..E))
+
+        local hasRestrict = C_RestrictedActions and type(C_RestrictedActions) == "table"
+        VUI.Print("Priority Rotation", "  C_RestrictedActions:       " .. (hasRestrict and G.."available"..E or R.."NOT FOUND"..E))
+
+        VUI.Print("Priority Rotation", "─────────────────────────────────────────")
+        -- Write-permission probe: write back the CVar's CURRENT value. It is the
+        -- player's own setting, so a diagnostic must never change it; a same-value
+        -- SetCVar still exercises write lockdown, which is all this probe tests.
+        local cvarCur = C_CVar.GetCVar("ActionButtonUseKeyDown")
+        local cvarOk, cvarErr = pcall(C_CVar.SetCVar, "ActionButtonUseKeyDown", cvarCur or "0")
+        if cvarOk then
+            VUI.Print("Priority Rotation", "  SetCVar ActionButtonUseKeyDown: " .. G .. "OK" .. E)
+        else
+            VUI.Print("Priority Rotation", "  SetCVar ActionButtonUseKeyDown: " .. R .. "BLOCKED" .. E)
+            VUI.Print("Priority Rotation", "    Error: " .. Y .. tostring(cvarErr) .. E)
+        end
+
+        local execOk, execErr = pcall(function()
+            PR.rotBtn:Execute("local t = newtable(); t[1] = 'diag_test'")
+        end)
+        if execOk then
+            VUI.Print("Priority Rotation", "  :Execute() newtable():    " .. G .. "OK" .. E)
+        else
+            VUI.Print("Priority Rotation", "  :Execute() newtable():    " .. R .. "BLOCKED" .. E)
+            VUI.Print("Priority Rotation", "    Error: " .. Y .. tostring(execErr) .. E)
+        end
+
+        local macroOk, macroResult = pcall(GetMacroIndexByName, PR.MACRO_NAME)
+        if macroOk then
+            local idx = macroResult or 0
+            if idx > 0 then
+                VUI.Print("Priority Rotation", "  GetMacroIndexByName(\"" .. PR.MACRO_NAME .. "\"): " .. G .. "idx=" .. idx .. E)
+            else
+                VUI.Print("Priority Rotation", "  GetMacroIndexByName(\"" .. PR.MACRO_NAME .. "\"): " .. Y .. "not found (idx=0)" .. E)
+            end
+            if hasIssecret and issecretvalue(macroResult) then
+                VUI.Print("Priority Rotation", "    ⚠ macroIndex is a " .. VUI.COL.ORANGE .. "SECRET VALUE|r")
+            end
+        else
+            VUI.Print("Priority Rotation", "  GetMacroIndexByName: " .. R .. "ERROR" .. E .. " — " .. tostring(macroResult))
+        end
+
+        VUI.Print("Priority Rotation", "─────────────────────────────────────────")
+        VUI.Print("Priority Rotation", "  Scanning slots 1-" .. PR.MAX_ACTION_SLOT .. " with GetActionInfo:")
+        local macroIdx    = macroOk and macroResult or 0
+        local foundSlots  = 0
+        local macroSlots  = {}
+        local secretSlots = 0
+        local errorSlots  = 0
+
+        for slot = 1, PR.MAX_ACTION_SLOT do
+            local ok, actionType, id = pcall(GetActionInfo, slot)
+            if ok then
+                if actionType then
+                    foundSlots = foundSlots + 1
+                    if hasIssecret then
+                        local typeSecret = issecretvalue(actionType)
+                        local idSecret   = issecretvalue(id)
+                        if typeSecret or idSecret then
+                            secretSlots = secretSlots + 1
+                            if secretSlots <= 5 then
+                                VUI.Print("Priority Rotation", "    Slot " .. Y .. slot .. E .. ": type="
+                                    .. (typeSecret and VUI.COL.ORANGE .. "<SECRET>|r" or tostring(actionType))
+                                    .. "  id="
+                                    .. (idSecret and VUI.COL.ORANGE .. "<SECRET>|r" or tostring(id)))
+                            end
+                        end
+                    end
+                    if actionType == "macro" and id == macroIdx and macroIdx > 0 then
+                        macroSlots[#macroSlots + 1] = slot
+                    end
+                end
+            else
+                errorSlots = errorSlots + 1
+                if errorSlots <= 3 then
+                    VUI.Print("Priority Rotation", "    Slot " .. Y .. slot .. E .. ": " .. R .. "ERROR" .. E .. " — " .. tostring(actionType))
+                end
+            end
+        end
+
+        VUI.Print("Priority Rotation", "  Summary:")
+        VUI.Print("Priority Rotation", "    Populated slots: " .. Y .. foundSlots .. E)
+        VUI.Print("Priority Rotation", "    Secret values:   " .. (secretSlots > 0 and R .. secretSlots .. E or G .. "0" .. E))
+        if secretSlots > 5 then
+            VUI.Print("Priority Rotation", "      (showing first 5 of " .. secretSlots .. ")")
+        end
+        VUI.Print("Priority Rotation", "    Errored slots:   " .. (errorSlots > 0 and R .. errorSlots .. E or G .. "0" .. E))
+        if #macroSlots > 0 then
+            VUI.Print("Priority Rotation", "    \"" .. PR.MACRO_NAME .. "\" macro found on: " .. G .. "slot(s) " .. tconcat(macroSlots, ", ") .. E)
+        else
+            VUI.Print("Priority Rotation", "    \"" .. PR.MACRO_NAME .. "\" macro found on: " .. R .. "NO SLOTS" .. E)
+            if macroIdx > 0 then
+                VUI.Print("Priority Rotation", "      (macro exists at idx=" .. macroIdx .. " but no slot matched)")
+            else
+                VUI.Print("Priority Rotation", "      (macro not in macro list — create with /pr macro)")
+            end
+        end
+
+        VUI.Print("Priority Rotation", "─────────────────────────────────────────")
+        local stepOk, stepVal = pcall(function() return PR.rotBtn:GetAttribute("step") end)
+        if stepOk then
+            local stepNum = tonumber(stepVal)
+            if hasIssecret and issecretvalue(stepVal) then
+                VUI.Print("Priority Rotation", "  rotBtn:GetAttribute('step'): " .. VUI.COL.ORANGE .. "SECRET VALUE|r")
+            elseif stepNum then
+                VUI.Print("Priority Rotation", "  rotBtn:GetAttribute('step'): " .. G .. stepNum .. E)
+            else
+                VUI.Print("Priority Rotation", "  rotBtn:GetAttribute('step'): " .. Y .. tostring(stepVal) .. " (type=" .. type(stepVal) .. ")" .. E)
+            end
+        else
+            VUI.Print("Priority Rotation", "  rotBtn:GetAttribute('step'): " .. R .. "ERROR" .. E .. " — " .. tostring(stepVal))
+        end
+
+        VUI.Print("Priority Rotation", "─────────────────────────────────────────")
+        local override = PR.overrides[PR.MACRO_NAME]
+        if override then
+            VUI.Print("Priority Rotation", "  Override slot: " .. G .. override.slot .. E)
+            if override.keys then
+                VUI.Print("Priority Rotation", "  Bound keys:   " .. G .. tconcat(override.keys, ", ") .. E)
+            else
+                VUI.Print("Priority Rotation", "  Bound keys:   " .. Y .. "none (macro found but no keybind assigned)" .. E)
+            end
+        else
+            VUI.Print("Priority Rotation", "  Override:     " .. R .. "not active" .. E .. " (run /pr scan)")
+        end
+
+        VUI.Print("Priority Rotation", "─────────────────────────────────────────")
+        VUI.Print("Priority Rotation", "  " .. Y .. "Run /pr diag in different contexts:" .. E)
+        VUI.Print("Priority Rotation", "    • Open world (no secrets)")
+        VUI.Print("Priority Rotation", "    • Inside M+/raid (secrets active)")
+        VUI.Print("Priority Rotation", "    • In combat vs. out of combat")
+
+    elseif cmd == "help" then
+        VUI.Print("Priority Rotation", "Commands:")
+        VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr|r           — toggle editor")
+        VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr settings|r  — where the settings are")
+        VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr scan|r      — bind to keybind/bar")
+        VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr macro|r     — create macro stub")
+        VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr status|r    — show current state at a glance")
+        VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr reset|r     — reset to spec defaults")
+        VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr clear|r     — clear spell list")
+        VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr test|r      — show compiled sequence")
+        VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr diag|r      — live-patch API diagnostic")
+        VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr debug|r     — toggle debug output")
+        VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr help|r      — show this help")
+
+    else
+        if PR.MainWindow then
+            if PR.MainWindow:IsShown() then
+                VUI.CloseManagedPanel(PR.MainWindow)
+            else
+                PR.MainWindow:ShowTab("editor")
+            end
+        else
+            VUI.Print("Priority Rotation", VUI.COL.RED .. "Editor failed to load. Try /reload|r")
+        end
+    end
+end
+
+-- ── Spec switching ──────────────────────────────────────────
+-- Shared by the Settings tab's Tools dropdown and the AddOns-menu flyout below, so both
+-- switch the same way. Returns "combat" when refused for combat, true when a switch was
+-- requested, false when there was nothing to do or the call failed.
+function PR.SwitchSpec(i)
+    if InCombatLockdown() then
+        VUI.Print("Priority Rotation", VUI.COL.RED .. "Can't switch spec in combat.|r")
+        return "combat"
+    end
+    if i == C_SpecializationInfo.GetSpecialization() then return false end
+    -- Midnight refactored the spec API into C_SpecializationInfo; the global
+    -- SetSpecialization may be absent or shimmed. Try the modern namespace first, fall back
+    -- to the global, surface the actual error if both fail so we can diagnose. err is
+    -- seeded because if neither API exists no pcall runs and it would stay nil, printing
+    -- "failed: nil" - the exact diagnostic dead end this block was written to prevent.
+    local ok, err = false, "no spec-switch API on this client"
+    if C_SpecializationInfo and C_SpecializationInfo.SetSpecialization then
+        ok, err = pcall(C_SpecializationInfo.SetSpecialization, i)
+    end
+    if not ok and SetSpecialization then
+        ok, err = pcall(SetSpecialization, i)
+    end
+    if not ok then
+        VUI.Print("Priority Rotation", VUI.COL.RED .. "Spec switch failed:|r " .. tostring(err))
+        return false
+    end
+    return true
+end
+
+-- ── Addon Compartment (minimap dropdown) ────────────────────
+function PriorityRotationDUI_OnAddonCompartmentClick()
+    C_Timer.After(0, function() SlashCmdList["PRDUI"]("") end)
+end
+
+-- Hovering our entry in the minimap AddOns menu opens a flyout of this character's specs.
+-- SOURCED (wow-ui-source live): Blizzard builds that menu itself, one plain button per addon,
+-- and tags its root "MENU_ADDON_COMPARTMENT" (Blizzard_Minimap/Mainline/AddonCompartment.lua:23,
+-- :33). Menu.ModifyMenu is Blizzard's extension point for tagged menus: our callback runs after
+-- their generator on EVERY open, with the freshly built descriptions (Blizzard_Menu/Menu.lua:
+-- 2623-2660), so the flyout is rebuilt each time and never duplicates. Our entry is found by its
+-- text, which MenuUtil stores on the description (MenuUtil.lua:172-178) and which Blizzard sets
+-- from our TOC Title (AddonCompartment.lua:85). Adding children to a button turns it into a
+-- submenu parent.
+-- MEASURED IN GAME (owner, 2026-10-24, Mac and PC): hovering opens the flyout, a spec click
+-- switches, and a click on the parent still runs our compartment function and opens the window.
+local function AddSpecFlyout(_, root)
+    if not (root and root.EnumerateElementDescriptions) then return end
+    local title = C_AddOns and C_AddOns.GetAddOnMetadata
+        and C_AddOns.GetAddOnMetadata(ADDON_NAME, "Title")
+    if not title then return end
+    local n = GetNumSpecializations and GetNumSpecializations() or 0
+    if n < 2 then return end
+    for _, desc in root:EnumerateElementDescriptions() do
+        if MenuUtil.GetElementText(desc) == title then
+            -- Same WoWUIBugs #783 defence as the Tools dropdown (Settings.lua): a submenu built by
+            -- addon code must not leave the menu compositor a tainted nil minimum width.
+            desc:SetMinimumWidth(1)
+            -- A submenu parent's click keeps the menu OPEN by default: the default (nil)
+            -- response only closes menus when the element has no children, unless the element
+            -- opts in (Menu.lua:2233-2243, flag at :742-748). Without this the AddOns menu stayed
+            -- on screen after the click opened our window, unlike every other entry.
+            desc:SetShouldRespondIfSubmenu(true)
+            for i = 1, n do
+                local id, name = C_SpecializationInfo.GetSpecializationInfo(i)
+                if id and name then
+                    desc:CreateRadio(name,
+                        function() return C_SpecializationInfo.GetSpecialization() == i end,
+                        function()
+                            if PR.SwitchSpec(i) == "combat" then return MenuResponse.Refresh end
+                            return MenuResponse.Close
+                        end)
+                end
+            end
+            return
+        end
+    end
+end
+
+if Menu and Menu.ModifyMenu and MenuUtil and MenuUtil.GetElementText then
+    Menu.ModifyMenu("MENU_ADDON_COMPARTMENT", AddSpecFlyout)
+end

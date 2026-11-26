@@ -22,7 +22,7 @@ for t in tests/*_test.lua; do
   result="$("$LUA" "$t" "$ADDON" 2>&1)"
   rc=$?
   printf '%-24s %s\n' "$(basename "$t" .lua)" "$(printf '%s\n' "$result" | tail -1)"
-  if [ $rc -ne 0 ]; then printf '%s\n' "$result" | grep FAIL; status=1; fi
+  if [ $rc -ne 0 ] || printf "%s\n" "$result" | grep -q "FAIL"; then printf '%s\n' "$result" | grep FAIL; status=1; fi
 done
 
 if [ $status -eq 0 ]; then echo "ALL GREEN"; else echo "FAILURES"; fi

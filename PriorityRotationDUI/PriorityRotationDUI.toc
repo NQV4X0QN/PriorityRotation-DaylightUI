@@ -1,12 +1,24 @@
 ## Interface: 16001
 ## Title: Priority Rotation (DaylightUI Plugin)
-## Notes: One-button rotation for WoW: Forever: step through a spell list you build, one key press at a time. Also hides chosen error messages and game sounds, and equips upgrades. Needs DaylightUI.
+## Notes: One-button rotation for WoW: Forever: step through a spell list you build, one key press at a time. Needs DaylightUI.
 ## Version: 0.1.0
 ## Author: NQV4X0QN
 ## X-Website: https://github.com/NQV4X0QN/PriorityRotation-DaylightUI
 ## X-License: GPL-2.0-or-later
 ## Dependencies: DaylightUI
+## OptionalDeps: VeritasUI_PriorityRotation
+## SavedVariables: PriorityRotationDUIDB
+## AddonCompartmentFunc: PriorityRotationDUI_OnAddonCompartmentClick
 ## Category: DaylightUI Plugins
 ## Group: PriorityRotationDUI
 
+Plugin.lua
+Lib.lua
+Look.lua
 Core.lua
+Reequip.lua
+Profiles.lua
+SpellbookOpener.lua
+Editor.lua
+Settings.lua
+Options.lua
