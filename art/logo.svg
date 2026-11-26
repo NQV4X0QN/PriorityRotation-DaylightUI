@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400" viewBox="0 0 400 400">
+  <defs>
+    <linearGradient id="dawn" gradientUnits="userSpaceOnUse" x1="60" y1="60" x2="340" y2="340">
+      <stop offset="0" stop-color="#1e90ff"/>
+      <stop offset="1" stop-color="#e65a72"/>
+    </linearGradient>
+    <radialGradient id="back" cx="0.5" cy="0.42" r="0.75">
+      <stop offset="0" stop-color="#22222a"/>
+      <stop offset="1" stop-color="#0c0c10"/>
+    </radialGradient>
+  </defs>
+  <rect x="0" y="0" width="400" height="400" rx="72" fill="url(#back)"/>
+  <!-- three arrows chasing each other round the centre: a rotation, one step at a time -->
+  <g fill="none" stroke="url(#dawn)" stroke-width="32" stroke-linecap="round">
+    <path d="M 220.5 83.8 A 118 118 0 0 1 316.2 179.5"/>
+    <path d="M 290.4 275.8 A 118 118 0 0 1 159.6 310.9"/>
+    <path d="M 89.1 240.4 A 118 118 0 0 1 124.2 109.6"/>
+  </g>
+  <g fill="url(#dawn)">
+    <polygon points="314.5,228.5 348.7,168.4 282.2,182.5"/>
+    <polygon points="118.0,284.9 153.0,344.6 174.0,279.9"/>
+    <polygon points="167.5,86.6 98.3,87.0 143.8,137.6"/>
+  </g>
+  <!-- the key press at the centre -->
+  <circle cx="200" cy="200" r="44" fill="url(#dawn)"/>
+  <circle cx="200" cy="200" r="29" fill="#0c0c10"/>
+  <circle cx="200" cy="200" r="14" fill="#f4efe6"/>
+</svg>
