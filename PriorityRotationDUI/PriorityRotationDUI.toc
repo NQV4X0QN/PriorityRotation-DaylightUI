@@ -23,4 +23,5 @@ Editor.lua
 Settings.lua
 ErrorText.lua
 Sounds.lua
+AutoEquip.lua
 Options.lua

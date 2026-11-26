@@ -1176,6 +1176,9 @@ SlashCmdList["PRDUI"] = function(msg)
             or  VUI.COL.ORANGE .. "none|r — assign a key to the macro's bar slot"))
         VUI.Print("Priority Rotation", "  Compiled: " .. #PR.compiledSequence .. " step(s)")
 
+    elseif cmd == "equipcheck" then
+        if PR.EquipCheck then PR.EquipCheck() end
+
     elseif cmd == "debug" then
         PR.debug = not PR.debug
         VUI.debug = PR.debug   -- also the combat-queue errors (Lib.lua)
@@ -1378,6 +1381,7 @@ SlashCmdList["PRDUI"] = function(msg)
         VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr clear|r     — clear spell list")
         VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr test|r      — show compiled sequence")
         VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr diag|r      — live-patch API diagnostic")
+        VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr equipcheck|r — what Auto Equip would put on")
         VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr debug|r     — toggle debug output")
         VUI.Print("Priority Rotation", "  " .. VUI.COL.YELLOW .. "/pr help|r      — show this help")
 

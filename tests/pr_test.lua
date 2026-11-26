@@ -279,7 +279,7 @@ local function boot(opts)
     if unit == "player" and filter == "HELPFUL" then return w.auras[name] end end }
   w.PR = {}
   for _, file in ipairs({ "Plugin", "Lib", "Widgets", "Core", "Reequip", "Profiles", "SpellbookOpener", "Editor",
-                             "Settings", "ErrorText", "Sounds", "Options" }) do
+                             "Settings", "ErrorText", "Sounds", "AutoEquip", "Options" }) do
     local chunk = assert(loadfile("PriorityRotationDUI/" .. file .. ".lua"))
     chunk("PriorityRotationDUI", w.PR)
   end
@@ -1055,6 +1055,28 @@ do
         and mod.defaults.muteSound_chimes == false)
   _G.MuteSoundFile, _G.UnmuteSoundFile = nil, nil
   local _ = w
+end
+
+-- 2026-11-25: Auto Equip on the Gear page (its decisions: autoequip_test). DISCRIMINATION: with the qualities'
+-- `disabled` dropped, 20b fails; with the equipcheck branch gone from /pr, 20d fails.
+out("P20) Auto Equip on the Gear page")
+do
+  local w = boot({ db = { enabled = true, profiles = {} } })
+  local mod = _G.__duiModules.PriorityRotationDUI
+  local page
+  for _, p in ipairs(mod and mod.options.pages or {}) do if p.id == "gear" then page = p end end
+  local rows = page and page.groups[1].items or {}
+  check("20a) the switch, then a row per quality; off, with Poor and Common chosen", #rows == 7
+        and rows[1].key == "autoEquip" and mod.defaults.autoEquip == false and mod.defaults.autoEquipPoor == true
+        and mod.defaults.autoEquipCommon == true and mod.defaults.autoEquipUncommon == false, #rows)
+  local get = function(k) return _G.__duiSettings[k] end
+  check("20b) the qualities are greyed while it is off", rows[2] and rows[2].disabled and rows[2].disabled(get) == true)
+  _G.__duiSettings.autoEquip = true
+  check("20c) and usable once it is on", rows[2] and rows[2].disabled(get) == false)
+  local ran = false
+  w.PR.EquipCheck = function() ran = true end
+  w.slash("equipcheck")
+  check("20d) /pr equipcheck runs the check", ran)
 end
 
 out(("=== %d passed, %d failed ==="):format(pass, fail))
