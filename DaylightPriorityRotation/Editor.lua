@@ -686,6 +686,7 @@ function PR:BuildEditor(page)
                     local ok, _, _, _, _, _, _, _, _, _, fresh = pcall(C_Item.GetItemInfo, e.itemID)
                     if ok and fresh then icon = fresh; e.icon = fresh end
                 end
+                row.right = row.freqFrame   -- the text stops short of the controls
                 row.Set({ icon = icon, text = e.spellName or e.macroName or e.itemName, sub = SubText(e, spells) })
                 row.freqLbl:SetText("x" .. (e.freq or 1))
                 row.decBtn:SetEnabled((e.freq or 1) > 1)
@@ -709,6 +710,9 @@ function PR:BuildEditor(page)
                     row.combatChk:Show()
                 end
             elseif shown then
+                -- No controls on the empty line, so its text runs the line's full width (owner, 2026-11-25: it was
+                -- cut short at the Frequency column and read "or...").
+                row.right = false
                 row.Set({ text = "Add an ability", sub = "Drag a spell, macro or trinket here, or click for your spellbook",
                     dim = true })
                 row.freqFrame:Hide()

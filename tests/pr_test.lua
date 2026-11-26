@@ -653,6 +653,12 @@ do
   local art = win and win.portraitArt
   check("6k) the class art is the portrait's size, 40 x 40, not zoomed in", art and rawget(art, "_w") == 40
         and rawget(art, "_h") == 40, art and tostring(rawget(art, "_w")))
+  -- Owner, 2026-11-25: the empty line's text was cut at the Frequency column ("... here, or..."): it kept room for controls
+  -- it does not have. DISCRIMINATION: with row.right left at the Frequency frame, 6l fails.
+  local row1 = ed and ed.rows[1]
+  local rightTo
+  for _, pt in ipairs(row1 and row1.block and row1.block._points or {}) do if pt[1] == "RIGHT" then rightTo = pt[2] end end
+  check("6l) the empty line's text runs to the line's right edge", rightTo == row1, tostring(rightTo))
 end
 out("P7) drag a slot to reorder (v1.35.11, replaced the up/down arrows)")
 do
