@@ -13,9 +13,9 @@ Its settings are in the DaylightUI options window, under **Plugins**.
 
 DaylightUI. This plugin is not part of DaylightUI: please report problems here, not to the DaylightUI team.
 
-## Status
+## Download
 
-In development. Not released yet.
+[CurseForge](https://www.curseforge.com/projects/1832101) or this repository's [releases](https://github.com/NQV4X0QN/PriorityRotation-DaylightUI/releases).
 
 ## License
 
