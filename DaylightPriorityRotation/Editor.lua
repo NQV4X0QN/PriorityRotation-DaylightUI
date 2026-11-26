@@ -713,7 +713,7 @@ function PR:BuildEditor(page)
                 -- No controls on the empty line, so its text runs the line's full width (owner, 2026-11-25: it was
                 -- cut short at the Frequency column and read "or...").
                 row.right = false
-                row.Set({ text = "Add an ability", sub = "Drag a spell, macro or trinket here, or click for your spellbook",
+                row.Set({ text = "Add an ability", sub = "Drag a spell, macro or trinket here",
                     dim = true })
                 row.freqFrame:Hide()
                 row.followBtn:Hide()
