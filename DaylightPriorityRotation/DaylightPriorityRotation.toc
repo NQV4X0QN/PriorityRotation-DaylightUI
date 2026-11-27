@@ -1,4 +1,4 @@
-## Interface: 16001
+## Interface: 16001, 120105
 ## Title: Priority Rotation (DaylightUI Plugin)
 ## Notes: One-button rotation for WoW: Forever: step through a spell list you build, one key press at a time. Needs DaylightUI.
 ## Version: 1.0.1

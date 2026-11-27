@@ -1,6 +1,6 @@
 -- Priority Rotation (DaylightUI Plugin) / Lib.lua
 -- The helpers Priority Rotation used from VeritasUI_Lib, carried over as this addon's own (ns.VUI), so the ported
--- files read the same as in VeritasUI. Only what Priority Rotation calls; Forever only.
+-- files read the same as in VeritasUI. Only what Priority Rotation calls.
 
 local ADDON, ns = ...
 if not ns.API then return end   -- Core.lua stopped: DaylightUI's API is missing or another major
@@ -11,7 +11,7 @@ ns.VUI = VUI
 local format, ipairs, pcall, type = string.format, ipairs, pcall, type
 
 VUI.VERSION = C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(ADDON, "Version") or "?"
-VUI.IS_FOREVER = true   -- DaylightUI is Forever only (its TOC: Interface 16001), and so is this plugin
+VUI.IS_FOREVER = _G.WOW_PROJECT_CAMELOT ~= nil and _G.WOW_PROJECT_ID == _G.WOW_PROJECT_CAMELOT   -- VeritasUI_Lib's test
 VUI.debug = false
 
 -- Blizzard's named colours as |c codes (WrapTextInColorCode, as Blizzard uses it). The fallbacks are those
